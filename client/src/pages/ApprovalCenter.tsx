@@ -1,11 +1,11 @@
 /*
- * Approval Center — Schedule review & publish workflow
- * Shows draft schedule status, compliance summary, and approval actions
+ * Approval & Export Center — Schedule review, publish, and export workflow
+ * Enhanced with: export format options, AI explainability summary,
+ * rule-by-rule compliance breakdown, and diff view
  */
 import { useState } from 'react';
 import {
   CheckSquare,
-  Clock,
   ShieldCheck,
   AlertTriangle,
   FileText,
@@ -15,12 +15,19 @@ import {
   XCircle,
   MessageSquare,
   Sparkles,
+  Download,
+  FileSpreadsheet,
+  Printer,
+  ArrowRight,
+  ChevronDown,
+  ChevronRight,
+  Info,
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
-import { DASHBOARD_METRICS, CONFLICTS, RULES, WEEK_LABEL } from '@/lib/mockData';
+import { CONFLICTS, RULES, WEEK_LABEL } from '@/lib/mockData';
 import { toast } from 'sonner';
 
 interface ApprovalItem {
@@ -35,6 +42,8 @@ interface ApprovalItem {
   unresolvedConflicts: number;
   aiScore: number;
   comments: { author: string; text: string; timestamp: string }[];
+  ruleBreakdown: { ruleId: string; status: 'pass' | 'warn' | 'fail'; detail: string }[];
+  aiExplanation: string[];
 }
 
 const APPROVAL_ITEMS: ApprovalItem[] = [
@@ -53,6 +62,24 @@ const APPROVAL_ITEMS: ApprovalItem[] = [
       { author: 'AI Engine', text: 'Schedule generated with 87% optimization score. 3 soft-rule warnings remain: couple shift mismatch, consecutive night advisory, and skip-shift info. All hard rules satisfied.', timestamp: '2026-04-23 08:45' },
       { author: 'Ops Manager', text: 'Reviewed couple shift issue — acceptable for this week due to training conflict. Please proceed with approval.', timestamp: '2026-04-23 09:15' },
     ],
+    ruleBreakdown: [
+      { ruleId: 'R01', status: 'pass', detail: 'All employees have ≥10hr rest between shifts' },
+      { ruleId: 'R02', status: 'pass', detail: 'Every employee has at least 1 RDO this week' },
+      { ruleId: 'R03', status: 'pass', detail: 'No employee exceeds 7 consecutive night shifts' },
+      { ruleId: 'R04', status: 'pass', detail: 'No night shift assigned before CPH' },
+      { ruleId: 'R05', status: 'pass', detail: 'All shift patterns last ≥2 consecutive days' },
+      { ruleId: 'R11', status: 'pass', detail: 'Minimum gaming demand met for all game types' },
+      { ruleId: 'R12', status: 'warn', detail: 'Couple shift R12: Chan/Leong mismatch on Wed — training conflict' },
+      { ruleId: 'R15', status: 'warn', detail: 'Soft R15: Wong has 3 consecutive night weeks (advisory, max 4)' },
+      { ruleId: 'R07', status: 'warn', detail: 'Soft R07: Lam has D→S skip-shift on Fri (transition shift recommended)' },
+    ],
+    aiExplanation: [
+      'Req RDO requests were honored for all 12 employees who submitted them.',
+      'Couple shift for Chan/Leong could not be fully satisfied due to training assignment on Wed — AI chose to preserve training (higher priority).',
+      'Wong\'s 3rd consecutive night week is within soft limit (max 4). AI flagged for manager awareness.',
+      'Lam\'s D→S transition on Fri was flagged but kept because no EV/ES slot was available without violating R11 demand.',
+      'Overall fairness score: Night shift distribution variance = 0.8 (target < 1.5). PHNW distribution balanced.',
+    ],
   },
   {
     id: 'APR-002',
@@ -68,6 +95,16 @@ const APPROVAL_ITEMS: ApprovalItem[] = [
     comments: [
       { author: 'Dept Approver', text: 'Approved. All conflicts resolved. Good work on the VIP event coverage.', timestamp: '2026-04-16 14:00' },
     ],
+    ruleBreakdown: [
+      { ruleId: 'R01', status: 'pass', detail: '10hr rest rule satisfied for all' },
+      { ruleId: 'R02', status: 'pass', detail: 'Weekly RDO requirement met' },
+      { ruleId: 'R11', status: 'pass', detail: 'Gaming demand fully covered' },
+      { ruleId: 'R15', status: 'warn', detail: 'Wong 2nd consecutive night week (within limit)' },
+    ],
+    aiExplanation: [
+      'All hard rules satisfied. 1 soft advisory for consecutive night tracking.',
+      'VIP event staffing handled by reassigning 2 spare dealers from Baccarat to Blackjack.',
+    ],
   },
   {
     id: 'APR-003',
@@ -81,6 +118,12 @@ const APPROVAL_ITEMS: ApprovalItem[] = [
     unresolvedConflicts: 0,
     aiScore: 89,
     comments: [],
+    ruleBreakdown: [
+      { ruleId: 'R01', status: 'pass', detail: '10hr rest satisfied' },
+      { ruleId: 'R02', status: 'pass', detail: 'RDO met' },
+      { ruleId: 'R11', status: 'pass', detail: 'Demand met' },
+    ],
+    aiExplanation: ['Standard week. All hard rules met. 2 soft advisories documented.'],
   },
 ];
 
@@ -100,6 +143,8 @@ function StatusBadge({ status }: { status: string }) {
 
 export default function ApprovalCenter() {
   const [selectedId, setSelectedId] = useState<string>(APPROVAL_ITEMS[0].id);
+  const [showRuleBreakdown, setShowRuleBreakdown] = useState(true);
+  const [showAIExplanation, setShowAIExplanation] = useState(true);
   const selected = APPROVAL_ITEMS.find(a => a.id === selectedId);
 
   return (
@@ -109,9 +154,9 @@ export default function ApprovalCenter() {
         <div className="p-4 border-b border-border shrink-0">
           <h2 className="text-sm font-mono font-semibold text-foreground tracking-wide flex items-center gap-2">
             <CheckSquare className="w-4 h-4 text-teal" />
-            APPROVAL QUEUE
+            APPROVAL & EXPORT
           </h2>
-          <p className="text-xs text-muted-foreground mt-1">Review and approve weekly schedules</p>
+          <p className="text-xs text-muted-foreground mt-1">Review, approve, and export weekly schedules</p>
         </div>
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
           {APPROVAL_ITEMS.map(item => (
@@ -153,7 +198,7 @@ export default function ApprovalCenter() {
       {/* Detail panel */}
       <div className="flex-1 overflow-y-auto p-5">
         {selected ? (
-          <div className="max-w-3xl space-y-5">
+          <div className="max-w-4xl space-y-5">
             {/* Header */}
             <div className="flex items-start justify-between">
               <div>
@@ -224,7 +269,72 @@ export default function ApprovalCenter() {
               </Card>
             </div>
 
-            {/* Unresolved conflicts summary */}
+            {/* AI Explainability Section */}
+            <Card className="bg-indigo/5 border-indigo/20">
+              <CardContent className="p-4">
+                <button
+                  className="flex items-center gap-2 w-full text-left"
+                  onClick={() => setShowAIExplanation(!showAIExplanation)}
+                >
+                  <Sparkles className="w-4 h-4 text-indigo" />
+                  <p className="text-sm font-medium text-foreground flex-1">AI Decision Explanation</p>
+                  {showAIExplanation ? <ChevronDown className="w-4 h-4 text-muted-foreground" /> : <ChevronRight className="w-4 h-4 text-muted-foreground" />}
+                </button>
+                {showAIExplanation && (
+                  <div className="mt-3 space-y-2">
+                    {selected.aiExplanation.map((exp, i) => (
+                      <div key={i} className="flex items-start gap-2">
+                        <ArrowRight className="w-3 h-3 text-indigo mt-0.5 shrink-0" />
+                        <p className="text-xs text-muted-foreground">{exp}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Rule-by-Rule Compliance Breakdown */}
+            <Card className="bg-card border-border">
+              <CardContent className="p-4">
+                <button
+                  className="flex items-center gap-2 w-full text-left"
+                  onClick={() => setShowRuleBreakdown(!showRuleBreakdown)}
+                >
+                  <ShieldCheck className="w-4 h-4 text-teal" />
+                  <p className="text-sm font-medium text-foreground flex-1">Rule-by-Rule Compliance</p>
+                  <Badge variant="outline" className="text-[10px] border-border text-muted-foreground">
+                    {selected.ruleBreakdown.filter(r => r.status === 'pass').length}/{selected.ruleBreakdown.length} pass
+                  </Badge>
+                  {showRuleBreakdown ? <ChevronDown className="w-4 h-4 text-muted-foreground" /> : <ChevronRight className="w-4 h-4 text-muted-foreground" />}
+                </button>
+                {showRuleBreakdown && (
+                  <div className="mt-3 space-y-1.5">
+                    {selected.ruleBreakdown.map((rb, i) => (
+                      <div key={i} className={`flex items-center gap-3 p-2 rounded text-xs ${
+                        rb.status === 'pass' ? 'bg-teal/5' : rb.status === 'warn' ? 'bg-amber/5' : 'bg-coral/5'
+                      }`}>
+                        {rb.status === 'pass' ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-teal shrink-0" />
+                        ) : rb.status === 'warn' ? (
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber shrink-0" />
+                        ) : (
+                          <XCircle className="w-3.5 h-3.5 text-coral shrink-0" />
+                        )}
+                        <span className="font-mono text-muted-foreground w-8 shrink-0">{rb.ruleId}</span>
+                        <span className="text-muted-foreground flex-1">{rb.detail}</span>
+                        <Badge variant="outline" className={`text-[10px] ${
+                          rb.status === 'pass' ? 'border-teal/30 text-teal' : rb.status === 'warn' ? 'border-amber/30 text-amber' : 'border-coral/30 text-coral'
+                        }`}>
+                          {rb.status}
+                        </Badge>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Unresolved conflicts */}
             {selected.unresolvedConflicts > 0 && (
               <Card className="bg-amber/5 border-amber/20">
                 <CardContent className="p-4">
@@ -250,19 +360,42 @@ export default function ApprovalCenter() {
                       );
                     })}
                   </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="mt-3 text-xs gap-1"
-                    onClick={() => toast.info('Navigate to Exception Center', { description: 'Feature coming soon' })}
-                  >
-                    <Eye className="w-3 h-3" /> Resolve in Exception Center
-                  </Button>
                 </CardContent>
               </Card>
             )}
 
-            {/* Audit trail / comments */}
+            {/* Export options */}
+            <Card className="bg-card border-border">
+              <CardContent className="p-4">
+                <h3 className="text-xs font-mono text-muted-foreground uppercase tracking-wider mb-3 flex items-center gap-2">
+                  <Download className="w-3.5 h-3.5" /> Export Options
+                </h3>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  <Button variant="outline" className="h-auto py-3 flex-col gap-1.5 text-xs" onClick={() => toast.info('Exporting Excel...', { description: 'Feature coming soon' })}>
+                    <FileSpreadsheet className="w-5 h-5 text-teal" />
+                    <span>Excel (.xlsx)</span>
+                    <span className="text-[10px] text-muted-foreground">Full schedule data</span>
+                  </Button>
+                  <Button variant="outline" className="h-auto py-3 flex-col gap-1.5 text-xs" onClick={() => toast.info('Exporting PDF...', { description: 'Feature coming soon' })}>
+                    <FileText className="w-5 h-5 text-coral" />
+                    <span>PDF Report</span>
+                    <span className="text-[10px] text-muted-foreground">Print-ready format</span>
+                  </Button>
+                  <Button variant="outline" className="h-auto py-3 flex-col gap-1.5 text-xs" onClick={() => toast.info('Exporting compliance...', { description: 'Feature coming soon' })}>
+                    <ShieldCheck className="w-5 h-5 text-indigo" />
+                    <span>Compliance Report</span>
+                    <span className="text-[10px] text-muted-foreground">Rule-by-rule audit</span>
+                  </Button>
+                  <Button variant="outline" className="h-auto py-3 flex-col gap-1.5 text-xs" onClick={() => toast.info('Printing...', { description: 'Feature coming soon' })}>
+                    <Printer className="w-5 h-5 text-amber" />
+                    <span>Print Preview</span>
+                    <span className="text-[10px] text-muted-foreground">Optimized for A3</span>
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Audit trail */}
             <Card className="bg-card border-border">
               <CardContent className="p-4">
                 <h3 className="text-xs font-mono text-muted-foreground uppercase tracking-wider mb-3 flex items-center gap-2">
@@ -290,8 +423,6 @@ export default function ApprovalCenter() {
                     </div>
                   ))}
                 </div>
-
-                {/* Add comment */}
                 <div className="mt-4 pt-3 border-t border-border flex items-center gap-2">
                   <input
                     type="text"
@@ -304,38 +435,6 @@ export default function ApprovalCenter() {
                 </div>
               </CardContent>
             </Card>
-
-            {/* Actions */}
-            {selected.status === 'pending' && (
-              <div className="flex items-center justify-between p-4 bg-secondary/20 rounded-md border border-border">
-                <div>
-                  <p className="text-sm font-medium text-foreground">Ready for approval?</p>
-                  <p className="text-xs text-muted-foreground">
-                    {selected.hardViolations === 0
-                      ? 'All hard rules are satisfied. Soft warnings can be overridden with documented reasons.'
-                      : 'Hard rule violations must be resolved before approval.'}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="text-xs gap-1"
-                    onClick={() => toast.info('Schedule preview', { description: 'Feature coming soon' })}
-                  >
-                    <Eye className="w-3 h-3" /> Preview Full Schedule
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="text-xs gap-1"
-                    onClick={() => toast.info('PDF export', { description: 'Feature coming soon' })}
-                  >
-                    <FileText className="w-3 h-3" /> Export PDF
-                  </Button>
-                </div>
-              </div>
-            )}
           </div>
         ) : (
           <div className="flex items-center justify-center h-full text-muted-foreground text-sm">

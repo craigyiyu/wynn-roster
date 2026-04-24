@@ -1,19 +1,23 @@
 /*
- * Rules & Constraints — Configuration area
- * Displays all hard/soft rules from the actual Wynn rostering rules
- * Allows toggling, priority weighting, and sprint filtering
+ * Rule Engine — Hard / Priority / Soft / Fairness / Override model
+ * Control Tower design: operational rule engine with clear priority order
+ * Shows the deterministic rule processing model, not a black-box
  */
 import { useState } from 'react';
 import {
   ShieldCheck,
   ShieldAlert,
-  Filter,
   ToggleLeft,
   ToggleRight,
   ChevronDown,
   ChevronRight,
   Info,
   Sliders,
+  ArrowRight,
+  Sparkles,
+  Lock,
+  Unlock,
+  Eye,
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -22,28 +26,41 @@ import { RULES, type Rule, type RuleCategory } from '@/lib/mockData';
 import { toast } from 'sonner';
 
 const CATEGORIES: RuleCategory[] = [
-  'Regulations',
-  'Business',
-  'Gaming Demand',
-  'Training',
-  'Overtime',
-  'Fairness',
-  'CPH',
-  'Special Request',
-  'Couple Shift',
+  'Regulations', 'Business', 'Gaming Demand', 'Training', 'Overtime',
+  'Fairness', 'CPH', 'Special Request', 'Couple Shift',
 ];
+
+const TAG_STYLES: Record<string, string> = {
+  'Hard Violation': 'bg-coral/10 text-coral border-coral/30',
+  'Soft Warning': 'bg-amber/10 text-amber border-amber/30',
+  'Priority Conflict': 'bg-indigo/10 text-indigo border-indigo/30',
+  'Override Allowed': 'bg-teal/10 text-teal border-teal/30',
+  'Override Not Allowed': 'bg-coral/10 text-coral border-coral/30',
+  'Needs Manager Review': 'bg-amber/10 text-amber border-amber/30',
+};
+
+function getRuleTags(rule: Rule): string[] {
+  const tags: string[] = [];
+  if (rule.severity === 'hard') tags.push('Hard Violation');
+  else tags.push('Soft Warning');
+  if (rule.overridable) tags.push('Override Allowed');
+  else tags.push('Override Not Allowed');
+  if (rule.category === 'Couple Shift' || rule.category === 'Special Request') tags.push('Priority Conflict');
+  if (rule.severity === 'soft' && rule.category === 'Fairness') tags.push('Needs Manager Review');
+  return tags;
+}
 
 function RuleRow({ rule, onToggle }: { rule: Rule; onToggle: () => void }) {
   const [expanded, setExpanded] = useState(false);
+  const tags = getRuleTags(rule);
 
   return (
     <div className={`border rounded-md transition-colors ${
       rule.severity === 'hard'
-        ? 'border-coral/20 bg-coral/3'
-        : 'border-amber/15 bg-amber/3'
+        ? 'border-coral/20 bg-coral/[0.03]'
+        : 'border-amber/15 bg-amber/[0.03]'
     } ${!rule.enabled ? 'opacity-40' : ''}`}>
       <div className="flex items-start gap-3 p-3">
-        {/* Toggle */}
         <button onClick={onToggle} className="mt-0.5 shrink-0">
           {rule.enabled ? (
             <ToggleRight className="w-5 h-5 text-teal" />
@@ -52,53 +69,48 @@ function RuleRow({ rule, onToggle }: { rule: Rule; onToggle: () => void }) {
           )}
         </button>
 
-        {/* Content */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className="text-[10px] font-mono text-muted-foreground">{rule.id}</span>
-            <Badge variant="outline" className={`text-[10px] ${
-              rule.severity === 'hard' ? 'border-coral/40 text-coral' : 'border-amber/40 text-amber'
-            }`}>
-              {rule.severity === 'hard' ? 'HARD RULE' : 'SOFT RULE'}
-            </Badge>
-            {!rule.overridable && (
-              <Badge variant="outline" className="text-[10px] border-coral/30 text-coral">
-                Cannot Override
+            <span className="text-[10px] font-mono text-muted-foreground">P{rule.priority}</span>
+            {tags.map(tag => (
+              <Badge key={tag} variant="outline" className={`text-[10px] ${TAG_STYLES[tag] || 'border-border text-muted-foreground'}`}>
+                {tag}
               </Badge>
-            )}
-            <Badge variant="outline" className="text-[10px] border-border text-muted-foreground">
-              {rule.sprint}
-            </Badge>
+            ))}
           </div>
           <p className="text-sm text-foreground mb-1">{rule.description}</p>
 
           {expanded && (
-            <div className="mt-2 space-y-2 text-xs text-muted-foreground">
-              <div className="flex items-start gap-2">
-                <Info className="w-3 h-3 mt-0.5 shrink-0 text-indigo" />
+            <div className="mt-2 space-y-2 text-xs text-muted-foreground bg-secondary/20 rounded-md p-3">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
                 <div>
                   <span className="text-indigo font-medium">Reason: </span>
                   {rule.reason}
                 </div>
-              </div>
-              {rule.referenceDoc && (
-                <div className="flex items-start gap-2">
-                  <Info className="w-3 h-3 mt-0.5 shrink-0 text-muted-foreground" />
+                {rule.referenceDoc && (
                   <div>
                     <span className="font-medium">Reference: </span>
                     {rule.referenceDoc}
                   </div>
+                )}
+                <div>
+                  <span className="font-medium">Sprint: </span>
+                  {rule.sprint}
                 </div>
-              )}
-              <div className="flex items-center gap-2">
-                <span className="font-medium">Priority:</span>
-                <span className="font-mono">{rule.priority}</span>
+                <div className="flex items-center gap-1">
+                  <span className="font-medium">Override: </span>
+                  {rule.overridable ? (
+                    <span className="flex items-center gap-1 text-teal"><Unlock className="w-3 h-3" /> Allowed with reason</span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-coral"><Lock className="w-3 h-3" /> Not allowed</span>
+                  )}
+                </div>
               </div>
             </div>
           )}
         </div>
 
-        {/* Expand */}
         <button onClick={() => setExpanded(!expanded)} className="text-muted-foreground hover:text-foreground shrink-0 mt-0.5">
           {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </button>
@@ -133,25 +145,51 @@ export default function RulesConstraints() {
   };
 
   return (
-    <div className="max-w-4xl space-y-5">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-sm font-mono font-semibold text-foreground tracking-wide flex items-center gap-2">
-            <ShieldCheck className="w-4 h-4 text-teal" />
-            RULES & CONSTRAINTS ENGINE
-          </h2>
-          <p className="text-xs text-muted-foreground mt-1">
-            Configure the AI scheduling engine's constraint logic. Based on Wynn Macau Table Games rostering rules v3.1.
-          </p>
-        </div>
-        <Button variant="outline" size="sm" className="text-xs gap-1" onClick={() => toast.info('Priority weighting', { description: 'Feature coming soon' })}>
-          <Sliders className="w-3 h-3" /> Priority Weights
-        </Button>
+    <div className="max-w-[1200px] space-y-5">
+      {/* Rule Processing Model */}
+      <Card className="bg-card border-border">
+        <CardContent className="p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <Sparkles className="w-4 h-4 text-indigo" />
+            <p className="text-sm font-medium text-foreground">Deterministic Rule Processing Model</p>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap text-xs mb-4">
+            <div className="px-3 py-1.5 bg-coral/10 border border-coral/20 rounded-md text-coral font-mono font-medium">Hard Rules</div>
+            <ArrowRight className="w-3 h-3 text-muted-foreground" />
+            <div className="px-3 py-1.5 bg-indigo/10 border border-indigo/20 rounded-md text-indigo font-mono font-medium">Priority Rules</div>
+            <ArrowRight className="w-3 h-3 text-muted-foreground" />
+            <div className="px-3 py-1.5 bg-amber/10 border border-amber/20 rounded-md text-amber font-mono font-medium">Soft Rules</div>
+            <ArrowRight className="w-3 h-3 text-muted-foreground" />
+            <div className="px-3 py-1.5 bg-teal/10 border border-teal/20 rounded-md text-teal font-mono font-medium">Fairness Scoring</div>
+            <ArrowRight className="w-3 h-3 text-muted-foreground" />
+            <div className="px-3 py-1.5 bg-secondary/50 border border-border rounded-md text-foreground font-mono font-medium">Manager Override</div>
+          </div>
+
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span className="font-mono text-foreground font-medium">PRIORITY ORDER:</span>
+            <Badge variant="outline" className="text-[10px] border-coral/40 text-coral">Req RDO</Badge>
+            <ArrowRight className="w-3 h-3" />
+            <Badge variant="outline" className="text-[10px] border-amber/40 text-amber">Approved Couple Shift</Badge>
+            <ArrowRight className="w-3 h-3" />
+            <Badge variant="outline" className="text-[10px] border-indigo/40 text-indigo">Special Request</Badge>
+            <ArrowRight className="w-3 h-3" />
+            <Badge variant="outline" className="text-[10px] border-teal/40 text-teal">Rotation Pattern</Badge>
+            <ArrowRight className="w-3 h-3" />
+            <Badge variant="outline" className="text-[10px] border-border text-muted-foreground">Fairness Rules</Badge>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Tag legend */}
+      <div className="flex items-center gap-2 flex-wrap text-xs px-1">
+        <span className="text-muted-foreground font-mono">TAGS:</span>
+        {Object.entries(TAG_STYLES).map(([tag, cls]) => (
+          <Badge key={tag} variant="outline" className={`text-[10px] ${cls}`}>{tag}</Badge>
+        ))}
       </div>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <Card className="bg-card border-border">
           <CardContent className="p-3 text-center">
             <p className="text-xl font-mono font-bold text-foreground">{rules.length}</p>
