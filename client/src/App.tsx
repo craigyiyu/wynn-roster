@@ -9,7 +9,7 @@ import Dashboard from "./pages/Dashboard";
 import ScheduleBuilder from "./pages/ScheduleBuilder";
 import ExceptionCenter from "./pages/ExceptionCenter";
 import TeamProfiles from "./pages/TeamProfiles";
-import RulesConstraints from "./pages/RulesConstraints";
+import RuleStudio from "./pages/RuleStudio";
 import ApprovalCenter from "./pages/ApprovalCenter";
 import DataIntake from "./pages/DataIntake";
 import ETLNormalization from "./pages/ETLNormalization";
@@ -17,6 +17,9 @@ import AIExtractionReview from "./pages/AIExtractionReview";
 import RosterGenerationFlow from "./pages/RosterGenerationFlow";
 import DemandSkills from "./pages/DemandSkills";
 import RotationView from "./pages/RotationView";
+import DataLineage from "./pages/DataLineage";
+import RosterValidation from "./pages/RosterValidation";
+import EmployeeTrace from "./pages/EmployeeTrace";
 
 function Router() {
   return (
@@ -26,7 +29,7 @@ function Router() {
         <Route path={"/schedule"} component={ScheduleBuilder} />
         <Route path={"/exceptions"} component={ExceptionCenter} />
         <Route path={"/team"} component={TeamProfiles} />
-        <Route path={"/rules"} component={RulesConstraints} />
+        <Route path={"/rules"} component={RuleStudio} />
         <Route path={"/approvals"} component={ApprovalCenter} />
         <Route path={"/intake"} component={DataIntake} />
         <Route path={"/etl"} component={ETLNormalization} />
@@ -34,6 +37,9 @@ function Router() {
         <Route path={"/generation"} component={RosterGenerationFlow} />
         <Route path={"/demand"} component={DemandSkills} />
         <Route path={"/rotation"} component={RotationView} />
+        <Route path={"/lineage"} component={DataLineage} />
+        <Route path={"/validation"} component={RosterValidation} />
+        <Route path={"/trace"} component={EmployeeTrace} />
         <Route path={"/404"} component={NotFound} />
         <Route component={NotFound} />
       </Switch>

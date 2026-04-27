@@ -1,7 +1,7 @@
 /*
  * Dashboard — Command Center
  * Control Tower design: dark, data-dense, operational urgency
- * Shows schedule health, critical alerts, headcount, AI insights
+ * Shows schedule health, critical alerts, AI insights, implementation coverage
  */
 import { useState } from 'react';
 import { useLocation } from 'wouter';
@@ -20,6 +20,9 @@ import {
   XCircle,
   Info,
   Zap,
+  Pause,
+  Database,
+  AlertCircle,
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -28,12 +31,12 @@ import { Progress } from '@/components/ui/progress';
 import {
   DASHBOARD_METRICS,
   ALERTS,
-  CONFLICTS,
   EMPLOYEES,
   GAME_DEMANDS,
   SHIFT_TYPES,
   type Alert,
 } from '@/lib/mockData';
+import { IMPLEMENTATION_COVERAGE, KNOWN_GAPS, BATCH_TASKS } from '@/lib/databaseMockData';
 
 function MetricCard({
   label,
@@ -122,11 +125,19 @@ function AlertRow({ alert, onNavigate }: { alert: Alert; onNavigate: () => void 
   );
 }
 
+const COVERAGE_STYLES: Record<string, { color: string; bg: string; border: string; icon: any }> = {
+  completed: { color: 'text-teal', bg: 'bg-teal/5', border: 'border-teal/20', icon: CheckCircle2 },
+  built_not_enabled: { color: 'text-amber', bg: 'bg-amber/5', border: 'border-amber/20', icon: Pause },
+  data_only: { color: 'text-indigo', bg: 'bg-indigo/5', border: 'border-indigo/20', icon: Database },
+  pending: { color: 'text-amber', bg: 'bg-amber/5', border: 'border-amber/20', icon: Clock },
+  future: { color: 'text-muted-foreground', bg: 'bg-secondary/20', border: 'border-border', icon: AlertCircle },
+};
+
 export default function Dashboard() {
   const [, navigate] = useLocation();
   const m = DASHBOARD_METRICS;
+  const batch = BATCH_TASKS[0];
 
-  // Gaming demand summary
   const demandIssues = GAME_DEMANDS.filter(d => d.currentDealers < d.minDealers || d.currentSupervisors < d.minSupervisors);
 
   return (
@@ -326,6 +337,51 @@ export default function Dashboard() {
             </Card>
           )}
         </div>
+      </div>
+
+      {/* Implementation Coverage Panel */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-mono font-semibold text-foreground tracking-wide flex items-center gap-2">
+            <ShieldCheck className="w-4 h-4 text-teal" />
+            IMPLEMENTATION COVERAGE
+          </h2>
+          <span className="text-[10px] font-mono text-muted-foreground">{batch.batch_id}</span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+          {IMPLEMENTATION_COVERAGE.map(cat => {
+            const style = COVERAGE_STYLES[cat.category];
+            const Icon = style.icon;
+            return (
+              <Card key={cat.category} className={`${style.bg} ${style.border}`}>
+                <CardContent className="p-3">
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <Icon className={`w-3.5 h-3.5 ${style.color}`} />
+                    <p className={`text-[10px] font-mono font-medium ${style.color}`}>{cat.label}</p>
+                  </div>
+                  <div className="space-y-1">
+                    {cat.items.map(item => (
+                      <p key={item} className="text-[10px] text-muted-foreground">• {item}</p>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+
+        {/* Known Gaps */}
+        <Card className="bg-secondary/10 border-border/50">
+          <CardContent className="p-3">
+            <p className="text-[10px] font-mono text-muted-foreground uppercase mb-1.5">Known Gaps & Notes</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-1">
+              {KNOWN_GAPS.map((gap, i) => (
+                <p key={i} className="text-[10px] text-muted-foreground">• {gap}</p>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );

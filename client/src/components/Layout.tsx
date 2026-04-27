@@ -2,7 +2,7 @@
  * Layout — Control Tower Design
  * Persistent left command rail + main viewport + top status strip
  * Dark theme: charcoal base, teal/amber/coral/indigo semantic colors
- * Updated with 11 pages organized into 3 nav sections
+ * V3: 15 pages organized into 4 nav sections
  */
 import { ReactNode, useState } from 'react';
 import { useLocation, Link } from 'wouter';
@@ -24,6 +24,9 @@ import {
   Workflow,
   BarChart3,
   RotateCcw,
+  Link2,
+  FileText,
+  ClipboardCheck,
 } from 'lucide-react';
 import { ALERTS } from '@/lib/mockData';
 
@@ -39,6 +42,7 @@ const NAV_SECTIONS: NavSection[] = [
       { path: '/intake', label: 'Data Intake', icon: FileSpreadsheet },
       { path: '/etl', label: 'ETL & Normalize', icon: Database },
       { path: '/extraction', label: 'AI Extraction', icon: Eye },
+      { path: '/lineage', label: 'Data Lineage', icon: Link2 },
     ],
   },
   {
@@ -55,9 +59,16 @@ const NAV_SECTIONS: NavSection[] = [
   {
     label: 'GOVERNANCE',
     items: [
-      { path: '/rules', label: 'Rule Engine', icon: ShieldCheck },
+      { path: '/rules', label: 'Rule Studio', icon: ShieldCheck },
       { path: '/team', label: 'Team & Profiles', icon: Users },
       { path: '/approvals', label: 'Approval & Export', icon: CheckSquare },
+    ],
+  },
+  {
+    label: 'AUDIT & TRACE',
+    items: [
+      { path: '/validation', label: 'Validation Console', icon: ClipboardCheck },
+      { path: '/trace', label: 'Employee Trace', icon: FileText },
     ],
   },
 ];
