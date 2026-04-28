@@ -13,12 +13,15 @@ import {
   deleteBatch,
   deleteAllBatches,
   getSessionStats,
+  getAllSessions,
+  deleteSession,
   Session,
   UploadBatch,
 } from '@/lib/sessionManager';
 
 export default function DataIntake() {
-  const [session, setSession] = useState<Session | null>(null);
+  const [currentSession, setCurrentSession] = useState<Session | null>(null);
+  const [allSessions, setAllSessions] = useState<Session[]>([]);
   const [batches, setBatches] = useState<UploadBatch[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -31,29 +34,34 @@ export default function DataIntake() {
 
   const initializeSession = async () => {
     try {
-      const currentSession = await getOrCreateSession();
-      setSession(currentSession);
-      await refreshBatches(currentSession.id);
+      const session = await getOrCreateSession();
+      setCurrentSession(session);
+      await refreshAllData(session.id);
     } catch (error) {
       console.error('[DataIntake] Failed to initialize session:', error);
       toast.error('Failed to initialize session');
     }
   };
 
-  const refreshBatches = async (sessionId: string) => {
+  const refreshAllData = async (sessionId: string) => {
     try {
+      // Refresh current session batches
       const sessionBatches = await getSessionBatches(sessionId);
       setBatches(sessionBatches);
       
       const stats = await getSessionStats(sessionId);
       setSessionStats(stats);
+
+      // Refresh all sessions
+      const sessions = await getAllSessions();
+      setAllSessions(sessions);
     } catch (error) {
-      console.error('[DataIntake] Failed to refresh batches:', error);
+      console.error('[DataIntake] Failed to refresh data:', error);
     }
   };
 
   const handleFiles = async (files: File[]) => {
-    if (!session) {
+    if (!currentSession) {
       toast.error('No session available');
       return;
     }
@@ -69,7 +77,7 @@ export default function DataIntake() {
 
         // Create upload batch
         const batch = await createUploadBatch(
-          session.id,
+          currentSession.id,
           file.name,
           fileType,
           sheets.length,
@@ -103,14 +111,17 @@ export default function DataIntake() {
 
           // Batch insert ETL records (500 rows per batch)
           await batchInsertETLRecords(
-            session.id,
+            currentSession.id,
             batch.id,
             etlRecords,
             (processed, total) => {
               totalRowsProcessed += processed;
-              const overallProgress = Math.round((totalRowsProcessed / (sheets.reduce((sum, s) => sum + s.rowCount, 0))) * 100);
+              const totalRows = sheets.reduce((sum, s) => sum + s.rowCount, 0);
+              let overallProgress = Math.round((totalRowsProcessed / totalRows) * 100);
+              // Cap progress at 99% until upload is complete
+              overallProgress = Math.min(overallProgress, 99);
               setUploadProgress(overallProgress);
-              console.log(`[DataIntake] Progress: ${processed}/${total} rows processed`);
+              console.log(`[DataIntake] Progress: ${processed}/${total} rows processed (${overallProgress}%)`);
             }
           );
         }
@@ -118,8 +129,8 @@ export default function DataIntake() {
         setUploadProgress(100);
         toast.success(`✅ File uploaded: ${file.name} (${batch.total_records} records)`);
         
-        // Refresh batches
-        await refreshBatches(session.id);
+        // Refresh data
+        await refreshAllData(currentSession.id);
         
       } catch (error) {
         console.error('[DataIntake] Error uploading file:', error);
@@ -158,7 +169,7 @@ export default function DataIntake() {
     try {
       await deleteBatch(batchId);
       toast.success(`Deleted: ${batchName}`);
-      if (session) await refreshBatches(session.id);
+      if (currentSession) await refreshAllData(currentSession.id);
     } catch (error) {
       console.error('[DataIntake] Error deleting batch:', error);
       toast.error('Failed to delete batch');
@@ -169,10 +180,10 @@ export default function DataIntake() {
     if (!window.confirm('Delete ALL files in this session? This cannot be undone.')) return;
 
     try {
-      if (session) {
-        await deleteAllBatches(session.id);
+      if (currentSession) {
+        await deleteAllBatches(currentSession.id);
         toast.success('All files deleted');
-        await refreshBatches(session.id);
+        await refreshAllData(currentSession.id);
       }
     } catch (error) {
       console.error('[DataIntake] Error deleting all batches:', error);
@@ -182,14 +193,48 @@ export default function DataIntake() {
 
   const handleNewSession = async () => {
     try {
-      const newSession = await createSession(`Session ${new Date().toLocaleDateString()}`);
-      setSession(newSession);
+      const newSession = await createSession();
+      setCurrentSession(newSession);
       setBatches([]);
       setSessionStats({ totalBatches: 0, totalRecords: 0, processedRecords: 0, completedBatches: 0 });
+      await refreshAllData(newSession.id);
       toast.success('New session created');
     } catch (error) {
       console.error('[DataIntake] Error creating session:', error);
       toast.error('Failed to create new session');
+    }
+  };
+
+  const handleSwitchSession = async (sessionId: string) => {
+    try {
+      const session = allSessions.find(s => s.id === sessionId);
+      if (session) {
+        setCurrentSession(session);
+        await refreshAllData(sessionId);
+        toast.success(`Switched to: ${session.session_name}`);
+      }
+    } catch (error) {
+      console.error('[DataIntake] Error switching session:', error);
+      toast.error('Failed to switch session');
+    }
+  };
+
+  const handleDeleteSession = async (sessionId: string, sessionName: string) => {
+    if (!window.confirm(`Delete "${sessionName}" and all its files? This cannot be undone.`)) return;
+
+    try {
+      await deleteSession(sessionId);
+      toast.success(`Deleted: ${sessionName}`);
+      // Switch to another session or create a new one
+      const remainingSessions = allSessions.filter(s => s.id !== sessionId);
+      if (remainingSessions.length > 0) {
+        await handleSwitchSession(remainingSessions[0].id);
+      } else {
+        await initializeSession();
+      }
+    } catch (error) {
+      console.error('[DataIntake] Error deleting session:', error);
+      toast.error('Failed to delete session');
     }
   };
 
@@ -202,15 +247,12 @@ export default function DataIntake() {
           <p className="text-slate-400">Upload and manage your roster data files</p>
         </div>
 
-        {/* Session Info Card */}
-        {session && (
+        {/* Current Session Info Card */}
+        {currentSession && (
           <Card className="bg-slate-800 border-slate-700 mb-6 p-4">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-lg font-semibold text-white">{session.session_name}</h2>
-                <p className="text-sm text-slate-400">
-                  Session ID: <code className="text-teal-400">{session.id.substring(0, 8)}...</code>
-                </p>
+                <h2 className="text-lg font-semibold text-white">{currentSession.session_name}</h2>
                 <p className="text-sm text-slate-400 mt-1">
                   📁 {sessionStats.totalBatches} files | 📝 {sessionStats.totalRecords} records | ✅ {sessionStats.completedBatches} completed
                 </p>
@@ -319,6 +361,58 @@ export default function DataIntake() {
                 <Trash2 className="w-4 h-4 mr-2" />
                 Delete All Files
               </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Session History - Simplified */}
+        {allSessions.length > 1 && (
+          <div className="mb-8">
+            <h2 className="text-2xl font-bold text-white mb-4">📋 Session History</h2>
+            <div className="space-y-2">
+              {allSessions.map((session) => (
+                <Card
+                  key={session.id}
+                  className={`bg-slate-800 border-slate-700 p-4 transition-colors ${
+                    currentSession?.id === session.id ? 'border-teal-500 bg-slate-750' : 'hover:border-slate-600'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-3">
+                        {currentSession?.id === session.id && (
+                          <div className="w-2 h-2 bg-teal-400 rounded-full" />
+                        )}
+                        <div>
+                          <h3 className="font-semibold text-white">{session.session_name}</h3>
+                          <p className="text-xs text-slate-400">
+                            {new Date(session.created_at).toLocaleString()}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {currentSession?.id !== session.id && (
+                        <Button
+                          onClick={() => handleSwitchSession(session.id)}
+                          variant="outline"
+                          size="sm"
+                        >
+                          Switch
+                        </Button>
+                      )}
+                      <Button
+                        onClick={() => handleDeleteSession(session.id, session.session_name)}
+                        variant="ghost"
+                        size="sm"
+                        className="text-red-400 hover:text-red-300"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </div>
+                </Card>
+              ))}
             </div>
           </div>
         )}

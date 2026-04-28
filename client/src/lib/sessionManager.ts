@@ -25,9 +25,16 @@ export interface UploadBatch {
 }
 
 /**
- * Create a new session
+ * Create a new session with auto-numbered name
  */
-export async function createSession(sessionName: string = 'Untitled Session'): Promise<Session> {
+export async function createSession(sessionName?: string): Promise<Session> {
+  // If no name provided, generate one with date
+  if (!sessionName) {
+    const allSessions = await getAllSessions();
+    const sessionNum = allSessions.length + 1;
+    sessionName = `Session #${sessionNum} - ${new Date().toLocaleDateString()}`;
+  }
+
   const { data, error } = await supabase
     .from('sessions')
     .insert([
@@ -42,6 +49,20 @@ export async function createSession(sessionName: string = 'Untitled Session'): P
 
   if (error) throw new Error(`Failed to create session: ${error.message}`);
   return data;
+}
+
+/**
+ * Get all sessions for the user
+ */
+export async function getAllSessions(): Promise<Session[]> {
+  const { data, error } = await supabase
+    .from('sessions')
+    .select('*')
+    .eq('user_id', 'default_user')
+    .order('created_at', { ascending: false });
+
+  if (error) throw new Error(`Failed to fetch sessions: ${error.message}`);
+  return data || [];
 }
 
 /**
