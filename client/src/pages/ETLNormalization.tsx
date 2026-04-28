@@ -8,15 +8,16 @@
  * Key behaviours:
  *  - Data is cached in memory after first load; subsequent visits are instant.
  *  - "Needs Review" shows ONLY records with ambiguous/hand-written RDO notes.
- *  - Each review record shows AI-parsed dates for human confirmation.
- *  - Approving saves the note→dates mapping to the pattern library.
- *  - Future identical notes are auto-resolved without human review.
+ *  - Each review card shows: employee payroll#, leave period, AI-parsed RDO dates.
+ *  - Approving writes to employee_rdo_requests table for scheduling use.
+ *  - Saves note→dates mapping to Pattern Library for future auto-resolution.
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   CheckCircle2, AlertTriangle, Eye, RefreshCw, ChevronDown, ChevronRight,
   Clock, FileText, Sparkles, Database, Calendar, BookOpen, Brain,
+  User, Hash, ArrowRight,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -31,7 +32,7 @@ import {
 import { parseRdoDates, formatRdoDates, ParsedRDO } from '@/lib/rdoParser';
 import {
   lookupPattern, savePattern, loadPatterns,
-  getAllPatterns, getPatternCount, RDOPattern,
+  getAllPatterns, RDOPattern,
 } from '@/lib/rdoLearning';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -51,17 +52,58 @@ function confBar(c: number) {
   return 'bg-coral';
 }
 
-/** Extract the human-readable note from a leave-request "notes" row */
+/** The long column header key used in leave request files */
+const LEAVE_NOTE_KEY_PATTERN = /leave requests report/i;
+
+/** Extract the note text from a leave-request row */
 function extractNoteText(nd: Record<string, unknown>): string {
-  for (const [, v] of Object.entries(nd)) {
-    if (typeof v === 'string' && v.trim() && v.trim().length > 0) {
+  // Find the long header column (contains "Leave Requests Report...")
+  for (const [k, v] of Object.entries(nd)) {
+    if (LEAVE_NOTE_KEY_PATTERN.test(k) && typeof v === 'string' && v.trim()) {
       return v.trim();
+    }
+  }
+  // Fallback: any non-empty string value
+  for (const [, v] of Object.entries(nd)) {
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+
+/** Extract payroll number from a leave record row (the row after the note row) */
+function extractPayrollFromLeaveRow(nd: Record<string, unknown>): string {
+  // The payroll # is in the long header column as a number
+  for (const [k, v] of Object.entries(nd)) {
+    if (LEAVE_NOTE_KEY_PATTERN.test(k) && v !== null && v !== '') {
+      return String(v);
     }
   }
   return '';
 }
 
-/** Determine if a record needs human review */
+/** Extract leave period string like "19/04/2026 - 22/04/2026" */
+function extractLeavePeriod(nd: Record<string, unknown>): string {
+  for (const [k, v] of Object.entries(nd)) {
+    if (k === '__EMPTY_4' && typeof v === 'string' && v.includes('/')) {
+      return v;
+    }
+  }
+  return '';
+}
+
+/** Extract leave type like "UnifL - Unified Leave" */
+function extractLeaveType(nd: Record<string, unknown>): string {
+  const v = nd['__EMPTY_3'];
+  return typeof v === 'string' ? v : '';
+}
+
+/** Extract leave status like "Approved" */
+function extractLeaveStatus(nd: Record<string, unknown>): string {
+  const v = nd['__EMPTY_1'];
+  return typeof v === 'string' ? v : '';
+}
+
+/** True if this record genuinely needs human review */
 function isActionableReview(rec: ETLRecord): boolean {
   if (rec.approved_by) return false;
   if (rec.warning_flags && rec.warning_flags.length > 0) return true;
@@ -102,6 +144,21 @@ function buildRecordSummary(rec: ETLRecord): { label: string; detail: string } {
   return { label: 'Record', detail: vals.join(' | ') };
 }
 
+/** Build a human-readable label for a raw_data field key */
+function friendlyKey(k: string): string {
+  const map: Record<string, string> = {
+    '__EMPTY': 'Class',
+    '__EMPTY_1': 'Status',
+    '__EMPTY_2': 'Submitted',
+    '__EMPTY_3': 'Leave Type',
+    '__EMPTY_4': 'Period',
+    '__EMPTY_5': 'Days',
+  };
+  if (map[k]) return map[k];
+  if (LEAVE_NOTE_KEY_PATTERN.test(k)) return 'Payroll #';
+  return k;
+}
+
 function fileIcon(fileType: string) {
   if (fileType === 'floor_spread') return '📊';
   if (fileType === 'shift') return '📅';
@@ -112,26 +169,45 @@ function fileIcon(fileType: string) {
 // ─── RDO Review Card ──────────────────────────────────────────────────────────
 
 /**
- * Specialised card for leave-request RDO notes.
- * Shows: raw note | AI-parsed dates | confidence | Approve button
+ * Specialised review card for leave-request RDO notes.
+ *
+ * Shows:
+ *  - Employee payroll # (from the NEXT row in the same batch)
+ *  - Their existing leave period from the file
+ *  - The raw hand-written note
+ *  - AI-parsed RDO dates with confidence
+ *  - Approve / Edit buttons
  */
 function RDOReviewCard({
   record,
+  nextRecord,   // the leave-data row immediately after this note row
   onApprove,
 }: {
   record: ETLRecord;
-  onApprove: (id: string, dates: string[], note: string, confidence: 'high' | 'medium' | 'low') => void;
+  nextRecord: ETLRecord | null;
+  onApprove: (id: string, dates: string[], note: string, confidence: 'high' | 'medium' | 'low', payrollNum: string) => void;
 }) {
+  const [editMode, setEditMode] = useState(false);
+  const [editedDates, setEditedDates] = useState<string[]>([]);
+  const [showRaw, setShowRaw] = useState(false);
+
   const nd = record.normalized_data ?? record.raw_data ?? {};
   const rawNote = extractNoteText(nd);
   const parsed: ParsedRDO | null = rawNote ? parseRdoDates(rawNote) : null;
   const knownPattern = rawNote ? lookupPattern(rawNote) : null;
   const isApproved = !!record.approved_by;
 
-  // Use known pattern dates if available, otherwise use parser result
-  const displayDates = knownPattern?.dates ?? parsed?.dates ?? [];
+  // Employee info from next row
+  const nextNd = nextRecord?.normalized_data ?? nextRecord?.raw_data ?? {};
+  const payrollNum = nextRecord ? extractPayrollFromLeaveRow(nextNd) : '';
+  const leavePeriod = nextRecord ? extractLeavePeriod(nextNd) : '';
+  const leaveType = nextRecord ? extractLeaveType(nextNd) : '';
+  const leaveStatus = nextRecord ? extractLeaveStatus(nextNd) : '';
+
+  // Dates to display
+  const displayDates = editMode ? editedDates : (knownPattern?.dates ?? parsed?.dates ?? []);
   const displayConf = knownPattern?.confidence ?? parsed?.confidence ?? 'low';
-  const isAutoResolved = !!knownPattern;
+  const isAutoResolved = !!knownPattern && !editMode;
 
   const confBadgeClass = displayConf === 'high'
     ? 'border-teal/40 text-teal bg-teal/5'
@@ -139,93 +215,291 @@ function RDOReviewCard({
     ? 'border-amber/40 text-amber bg-amber/5'
     : 'border-coral/40 text-coral bg-coral/5';
 
+  const handleEditToggle = () => {
+    if (!editMode) {
+      setEditedDates(displayDates);
+    }
+    setEditMode(!editMode);
+  };
+
+  const handleDateToggle = (iso: string) => {
+    setEditedDates(prev =>
+      prev.includes(iso) ? prev.filter(d => d !== iso) : [...prev, iso].sort()
+    );
+  };
+
+  // Generate candidate dates for the roster period (Apr 13-26)
+  const candidateDates = Array.from({ length: 18 }, (_, i) => {
+    const d = i + 13;
+    return `2026-04-${String(d).padStart(2, '0')}`;
+  });
+
   return (
-    <div className={`border border-border rounded-lg p-3 space-y-2 transition-all ${
-      isApproved ? 'opacity-40 bg-teal/3' : isAutoResolved ? 'bg-teal/5 border-teal/20' : 'bg-amber/3 border-amber/10'
+    <div className={`border rounded-lg overflow-hidden transition-all ${
+      isApproved
+        ? 'border-teal/20 bg-teal/3 opacity-50'
+        : isAutoResolved
+        ? 'border-teal/20 bg-teal/5'
+        : 'border-amber/20 bg-amber/3'
     }`}>
-      {/* Top row: row number + note + status */}
-      <div className="flex items-start gap-3">
-        <span className="font-mono text-[10px] text-muted-foreground mt-0.5 w-10 flex-shrink-0">
+      {/* Card header: employee info */}
+      <div className="flex items-center gap-3 px-3 py-2 border-b border-border/50 bg-secondary/10">
+        <span className="font-mono text-[10px] text-muted-foreground w-8 flex-shrink-0">
           #{record.row_number}
         </span>
-
-        <div className="flex-1 min-w-0">
-          {/* Raw note */}
-          <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-[9px] text-muted-foreground uppercase tracking-wider flex-shrink-0">Note:</span>
-            <span className="text-xs font-mono text-amber/90 bg-amber/5 px-2 py-0.5 rounded border border-amber/20 truncate">
-              {rawNote || '(empty)'}
+        <div className="flex items-center gap-1.5 flex-1 min-w-0">
+          <User className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+          {payrollNum ? (
+            <span className="text-xs font-mono font-medium text-foreground/90">
+              Payroll #{payrollNum}
             </span>
-          </div>
-
-          {/* AI extraction result */}
-          <div className="flex items-center gap-2">
-            <span className="text-[9px] text-muted-foreground uppercase tracking-wider flex-shrink-0 flex items-center gap-1">
-              <Brain className="w-2.5 h-2.5" />
-              {isAutoResolved ? 'Known:' : 'AI reads:'}
-            </span>
-
-            {displayDates.length > 0 ? (
-              <div className="flex items-center gap-1.5 flex-wrap">
-                {displayDates.map(iso => {
-                  const d = new Date(iso + 'T00:00:00');
-                  const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                  return (
-                    <span
-                      key={iso}
-                      className="flex items-center gap-1 text-[10px] font-medium text-teal bg-teal/10 border border-teal/30 px-2 py-0.5 rounded"
-                    >
-                      <Calendar className="w-2.5 h-2.5" />
-                      {label}
-                    </span>
-                  );
-                })}
-                <Badge variant="outline" className={`text-[9px] px-1.5 ${confBadgeClass}`}>
-                  {displayConf}
-                </Badge>
-                {isAutoResolved && (
-                  <span className="text-[9px] text-teal/60 flex items-center gap-0.5">
-                    <BookOpen className="w-2.5 h-2.5" /> learned
-                  </span>
-                )}
-              </div>
-            ) : (
-              <span className="text-[10px] text-coral/80 flex items-center gap-1">
-                <AlertTriangle className="w-3 h-3" />
-                Could not parse dates — review manually
-              </span>
-            )}
-          </div>
+          ) : (
+            <span className="text-xs text-muted-foreground italic">Employee unknown</span>
+          )}
+          {leavePeriod && (
+            <>
+              <span className="text-muted-foreground/40 mx-1">·</span>
+              <Calendar className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+              <span className="text-[10px] text-muted-foreground truncate">{leavePeriod}</span>
+            </>
+          )}
+          {leaveType && (
+            <>
+              <span className="text-muted-foreground/40 mx-1">·</span>
+              <span className="text-[10px] text-muted-foreground truncate">{leaveType}</span>
+            </>
+          )}
+          {leaveStatus && (
+            <Badge variant="outline" className="text-[9px] px-1 border-teal/30 text-teal ml-1">
+              {leaveStatus}
+            </Badge>
+          )}
         </div>
-
-        {/* Approve button */}
-        {!isApproved && (
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-6 text-[10px] px-2.5 border-teal/40 text-teal hover:bg-teal/10 flex-shrink-0 gap-1"
-            onClick={() => onApprove(
-              record.id,
-              displayDates,
-              rawNote,
-              displayConf as 'high' | 'medium' | 'low',
-            )}
-          >
-            <CheckCircle2 className="w-3 h-3" />
-            Approve
-          </Button>
-        )}
         {isApproved && (
           <span className="text-[9px] text-teal flex items-center gap-1 flex-shrink-0">
             <CheckCircle2 className="w-3 h-3" /> Approved
           </span>
         )}
       </div>
+
+      {/* Card body */}
+      <div className="p-3 space-y-2.5">
+        {/* Raw note */}
+        <div className="flex items-start gap-2">
+          <span className="text-[9px] text-muted-foreground uppercase tracking-wider mt-0.5 w-16 flex-shrink-0">
+            Note:
+          </span>
+          <span className="text-xs font-mono text-amber/90 bg-amber/5 px-2 py-0.5 rounded border border-amber/20 flex-1">
+            {rawNote || '(empty)'}
+          </span>
+        </div>
+
+        {/* AI extraction */}
+        <div className="flex items-start gap-2">
+          <span className="text-[9px] text-muted-foreground uppercase tracking-wider mt-0.5 w-16 flex-shrink-0 flex items-center gap-1">
+            <Brain className="w-2.5 h-2.5" />
+            {isAutoResolved ? 'Known:' : 'AI reads:'}
+          </span>
+
+          <div className="flex-1">
+            {!editMode ? (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {displayDates.length > 0 ? (
+                  <>
+                    {/* Arrow showing the interpretation */}
+                    <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                      <ArrowRight className="w-3 h-3" />
+                      <span className="font-medium text-foreground/70">RDO on:</span>
+                    </span>
+                    {displayDates.map(iso => {
+                      const d = new Date(iso + 'T00:00:00');
+                      const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                      return (
+                        <span
+                          key={iso}
+                          className="flex items-center gap-1 text-[11px] font-semibold text-teal bg-teal/10 border border-teal/30 px-2 py-0.5 rounded"
+                        >
+                          <Calendar className="w-2.5 h-2.5" />
+                          {label}
+                        </span>
+                      );
+                    })}
+                    <Badge variant="outline" className={`text-[9px] px-1.5 ${confBadgeClass}`}>
+                      {displayConf}
+                    </Badge>
+                    {isAutoResolved && (
+                      <span className="text-[9px] text-teal/60 flex items-center gap-0.5">
+                        <BookOpen className="w-2.5 h-2.5" /> learned
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <span className="text-[10px] text-coral/80 flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3" />
+                    Could not parse dates — please edit manually
+                  </span>
+                )}
+              </div>
+            ) : (
+              /* Edit mode: date picker grid */
+              <div className="space-y-1.5">
+                <div className="text-[9px] text-amber mb-1">Select the correct RDO dates:</div>
+                <div className="flex flex-wrap gap-1">
+                  {candidateDates.map(iso => {
+                    const d = new Date(iso + 'T00:00:00');
+                    const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                    const selected = editedDates.includes(iso);
+                    return (
+                      <button
+                        key={iso}
+                        onClick={() => handleDateToggle(iso)}
+                        className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${
+                          selected
+                            ? 'border-teal text-teal bg-teal/15 font-semibold'
+                            : 'border-border text-muted-foreground hover:border-teal/50 hover:text-teal/70'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Confirmation question */}
+        {!isApproved && displayDates.length > 0 && !editMode && (
+          <div className="flex items-center gap-2 pt-1 border-t border-border/30">
+            <div className="flex-1 text-[10px] text-muted-foreground">
+              Confirm: <span className="font-medium text-foreground/80">
+                Payroll #{payrollNum || '?'}
+              </span> requests RDO on{' '}
+              <span className="text-teal font-medium">{formatRdoDates(displayDates)}</span>?
+            </div>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <Button
+                size="sm" variant="outline"
+                className="h-6 text-[10px] px-2 border-border text-muted-foreground hover:border-amber/50 hover:text-amber"
+                onClick={handleEditToggle}
+              >
+                Edit
+              </Button>
+              <Button
+                size="sm" variant="outline"
+                className="h-6 text-[10px] px-2.5 border-teal/40 text-teal hover:bg-teal/10 gap-1"
+                onClick={() => onApprove(record.id, displayDates, rawNote, displayConf as 'high' | 'medium' | 'low', payrollNum)}
+              >
+                <CheckCircle2 className="w-3 h-3" /> Approve
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Edit mode actions */}
+        {!isApproved && editMode && (
+          <div className="flex items-center gap-2 pt-1 border-t border-border/30">
+            <div className="flex-1 text-[10px] text-muted-foreground">
+              {editedDates.length === 0
+                ? 'Select at least one date'
+                : `Selected: ${formatRdoDates(editedDates)}`}
+            </div>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <Button
+                size="sm" variant="outline"
+                className="h-6 text-[10px] px-2 border-border text-muted-foreground"
+                onClick={() => setEditMode(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm" variant="outline"
+                className="h-6 text-[10px] px-2.5 border-teal/40 text-teal hover:bg-teal/10 gap-1"
+                disabled={editedDates.length === 0}
+                onClick={() => {
+                  setEditMode(false);
+                  onApprove(record.id, editedDates, rawNote, 'high', payrollNum);
+                }}
+              >
+                <CheckCircle2 className="w-3 h-3" /> Approve
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* No dates, not approved */}
+        {!isApproved && displayDates.length === 0 && !editMode && (
+          <div className="flex items-center gap-2 pt-1 border-t border-border/30">
+            <span className="flex-1 text-[10px] text-muted-foreground">
+              AI could not parse dates. Please edit manually.
+            </span>
+            <Button
+              size="sm" variant="outline"
+              className="h-6 text-[10px] px-2 border-amber/40 text-amber hover:bg-amber/10"
+              onClick={handleEditToggle}
+            >
+              Edit Dates
+            </Button>
+          </div>
+        )}
+
+        {/* Raw data toggle */}
+        <div>
+          <button
+            className="text-[9px] text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
+            onClick={() => setShowRaw(!showRaw)}
+          >
+            {showRaw ? <ChevronDown className="w-2.5 h-2.5" /> : <ChevronRight className="w-2.5 h-2.5" />}
+            Raw data
+          </button>
+          {showRaw && (
+            <div className="mt-1.5 grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-[9px] text-muted-foreground uppercase tracking-wider mb-1 flex items-center gap-1">
+                  <Database className="w-2.5 h-2.5" /> Note Row (#{record.row_number})
+                </div>
+                <div className="font-mono text-[9px] text-foreground/70 space-y-0.5 bg-secondary/20 rounded p-2">
+                  {Object.entries(record.raw_data ?? {}).map(([k, v]) => {
+                    const val = String(v ?? '');
+                    if (!val) return null;
+                    return (
+                      <div key={k} className="flex gap-2">
+                        <span className="text-muted-foreground w-20 truncate flex-shrink-0">{friendlyKey(k)}:</span>
+                        <span className="truncate text-foreground/80">{val}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              {nextRecord && (
+                <div>
+                  <div className="text-[9px] text-muted-foreground uppercase tracking-wider mb-1 flex items-center gap-1">
+                    <User className="w-2.5 h-2.5" /> Employee Row (#{nextRecord.row_number})
+                  </div>
+                  <div className="font-mono text-[9px] text-foreground/70 space-y-0.5 bg-secondary/20 rounded p-2">
+                    {Object.entries(nextRecord.raw_data ?? {}).map(([k, v]) => {
+                      const val = String(v ?? '');
+                      if (!val) return null;
+                      return (
+                        <div key={k} className="flex gap-2">
+                          <span className="text-muted-foreground w-20 truncate flex-shrink-0">{friendlyKey(k)}:</span>
+                          <span className="truncate text-foreground/80">{val}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
 
-// ─── Standard Record Row ──────────────────────────────────────────────────────
+// ─── Standard Record Row (non-leave files) ────────────────────────────────────
 
 function RecordRow({
   record,
@@ -240,6 +514,17 @@ function RecordRow({
   const isApproved = !!record.approved_by;
   const isReview = isActionableReview(record);
 
+  // Build display-friendly data rows, filtering empty values
+  const rawEntries = Object.entries(record.raw_data ?? {}).filter(([, v]) => {
+    const s = String(v ?? '').trim();
+    return s !== '' && s !== 'null' && s !== 'undefined' && s !== 'nan';
+  });
+
+  const normEntries = Object.entries(record.normalized_data ?? record.raw_data ?? {}).filter(([, v]) => {
+    const s = String(v ?? '').trim();
+    return s !== '' && s !== 'null' && s !== 'undefined' && s !== 'nan';
+  });
+
   return (
     <div className={`border-b border-border last:border-0 transition-colors ${isReview ? 'bg-amber/3' : ''} ${isApproved ? 'opacity-50' : ''}`}>
       <div
@@ -251,8 +536,8 @@ function RecordRow({
           : <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />}
         <span className="font-mono text-[10px] text-muted-foreground w-10 flex-shrink-0">#{record.row_number}</span>
         <span className="text-[10px] text-muted-foreground w-20 truncate flex-shrink-0">{record.source_sheet}</span>
-        <span className="text-muted-foreground flex-shrink-0 w-24">{label}</span>
-        <span className="flex-1 truncate text-foreground/80">{detail}</span>
+        <span className="text-muted-foreground flex-shrink-0 w-24 text-[10px]">{label}</span>
+        <span className="flex-1 truncate text-foreground/80 text-[10px]">{detail}</span>
         <div className="flex items-center gap-1.5 flex-shrink-0 w-16">
           <div className="flex-1 h-1 bg-secondary rounded-full overflow-hidden">
             <div className={`h-full rounded-full ${confBar(conf)}`} style={{ width: `${conf}%` }} />
@@ -274,34 +559,60 @@ function RecordRow({
           </Button>
         )}
       </div>
+
       {expanded && (
-        <div className="px-4 pb-3 grid grid-cols-2 gap-3 bg-secondary/10">
-          <div>
-            <div className="text-[9px] text-muted-foreground uppercase tracking-wider mb-1.5 flex items-center gap-1">
-              <Database className="w-2.5 h-2.5" /> Raw Data
+        <div className="px-4 pb-3 bg-secondary/10">
+          {rawEntries.length === 0 && normEntries.length === 0 ? (
+            <div className="text-[10px] text-muted-foreground py-2">No data fields available.</div>
+          ) : (
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <div>
+                <div className="text-[9px] text-muted-foreground uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                  <Database className="w-2.5 h-2.5" /> Raw Data
+                  {rawEntries.length === 0 && <span className="text-coral">(empty)</span>}
+                </div>
+                {rawEntries.length > 0 ? (
+                  <div className="font-mono text-[9px] text-foreground/70 space-y-0.5 max-h-40 overflow-y-auto bg-secondary/20 rounded p-2">
+                    {rawEntries.map(([k, v]) => (
+                      <div key={k} className="flex gap-2">
+                        <span className="text-muted-foreground w-28 truncate flex-shrink-0">{friendlyKey(k)}:</span>
+                        <span className="truncate text-foreground/80">{String(v)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-[9px] text-muted-foreground italic">All fields empty</div>
+                )}
+              </div>
+              <div>
+                <div className="text-[9px] text-muted-foreground uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                  <Sparkles className="w-2.5 h-2.5" /> Normalized
+                </div>
+                {normEntries.length > 0 ? (
+                  <div className="font-mono text-[9px] text-foreground/70 space-y-0.5 max-h-40 overflow-y-auto bg-secondary/20 rounded p-2">
+                    {normEntries.map(([k, v]) => (
+                      <div key={k} className="flex gap-2">
+                        <span className="text-muted-foreground w-28 truncate flex-shrink-0">{friendlyKey(k)}:</span>
+                        <span className="truncate text-foreground/80">{String(v)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-[9px] text-muted-foreground italic">Same as raw data</div>
+                )}
+              </div>
             </div>
-            <div className="font-mono text-[9px] text-foreground/70 space-y-0.5 max-h-32 overflow-y-auto">
-              {Object.entries(record.raw_data ?? {}).map(([k, v]) => (
-                <div key={k} className="flex gap-2">
-                  <span className="text-muted-foreground w-28 truncate flex-shrink-0">{k}:</span>
-                  <span className="truncate">{String(v ?? '')}</span>
+          )}
+          {record.warning_flags && record.warning_flags.length > 0 && (
+            <div className="mt-2">
+              <div className="text-[9px] text-amber uppercase tracking-wider mb-1">Warnings</div>
+              {record.warning_flags.map((w, i) => (
+                <div key={i} className="text-[9px] text-amber/80 flex items-center gap-1">
+                  <AlertTriangle className="w-2.5 h-2.5" /> {w}
                 </div>
               ))}
             </div>
-          </div>
-          <div>
-            <div className="text-[9px] text-muted-foreground uppercase tracking-wider mb-1.5 flex items-center gap-1">
-              <Sparkles className="w-2.5 h-2.5" /> Normalized
-            </div>
-            <div className="font-mono text-[9px] text-foreground/70 space-y-0.5 max-h-32 overflow-y-auto">
-              {Object.entries(record.normalized_data ?? record.raw_data ?? {}).map(([k, v]) => (
-                <div key={k} className="flex gap-2">
-                  <span className="text-muted-foreground w-28 truncate flex-shrink-0">{k}:</span>
-                  <span className="truncate">{String(v ?? '')}</span>
-                </div>
-              ))}
-            </div>
-          </div>
+          )}
         </div>
       )}
     </div>
@@ -321,7 +632,7 @@ function FileGroupCard({
   records: ETLRecord[];
   filter: FilterType;
   onApprove: (id: string) => void;
-  onApproveRDO: (id: string, dates: string[], note: string, confidence: 'high' | 'medium' | 'low') => void;
+  onApproveRDO: (id: string, dates: string[], note: string, confidence: 'high' | 'medium' | 'low', payrollNum: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const isLeaveFile = batch.upload_name?.toLowerCase().includes('leave request');
@@ -339,6 +650,9 @@ function FileGroupCard({
     if (filter === 'ok') return !isActionableReview(r) && !r.approved_by;
     return true;
   });
+
+  // Build a row_number → record map for quick lookup (to find next row)
+  const rowMap = new Map(records.map(r => [r.row_number, r]));
 
   return (
     <Card className="bg-card border-border overflow-hidden">
@@ -377,7 +691,7 @@ function FileGroupCard({
 
       {expanded && (
         <div>
-          {/* Leave request files: show RDO review cards */}
+          {/* Leave request files in review mode: show RDO review cards */}
           {isLeaveFile && filter === 'review' ? (
             <div className="p-3 space-y-2">
               {filteredRecords.length === 0 ? (
@@ -386,15 +700,21 @@ function FileGroupCard({
                 <>
                   <div className="text-[9px] text-muted-foreground mb-2 flex items-center gap-1">
                     <Brain className="w-3 h-3 text-teal" />
-                    AI has extracted RDO dates from each note. Review and approve to confirm.
+                    AI has extracted RDO dates from each note. Review employee info and approve to confirm.
                   </div>
                   {filteredRecords.map(rec => (
-                    <RDOReviewCard key={rec.id} record={rec} onApprove={onApproveRDO} />
+                    <RDOReviewCard
+                      key={rec.id}
+                      record={rec}
+                      nextRecord={rowMap.get(rec.row_number + 1) ?? null}
+                      onApprove={onApproveRDO}
+                    />
                   ))}
                 </>
               )}
             </div>
           ) : (
+            /* All other files: standard table view */
             <div>
               <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-secondary/20 text-[9px] text-muted-foreground uppercase tracking-wider">
                 <span className="w-3 flex-shrink-0" />
@@ -485,7 +805,6 @@ function LearningLogPanel({ patterns }: { patterns: RDOPattern[] }) {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function ETLNormalization() {
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [batches, setBatches] = useState<UploadBatch[]>([]);
   const [records, setRecords] = useState<ETLRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -505,7 +824,6 @@ export default function ETLNormalization() {
       setLoadingMsg('Resolving session...');
       const session = await getOrCreateSession();
       const sid = session.id;
-      setSessionId(sid);
 
       if (!forceRefresh) {
         setLoadingMsg('Checking cache...');
@@ -535,19 +853,16 @@ export default function ETLNormalization() {
   useEffect(() => {
     if (!loadedRef.current) {
       loadedRef.current = true;
-      // Load patterns from Supabase in background
       loadPatterns().then(refreshPatterns);
       loadData(false);
     }
   }, [loadData]);
 
-  // Standard approve (non-RDO records)
+  // Standard approve
   const handleApprove = async (recordId: string) => {
     cacheApproveRecord(recordId, 'ops_manager');
     setRecords(prev => prev.map(r =>
-      r.id === recordId
-        ? { ...r, approved_by: 'ops_manager', approved_at: new Date().toISOString() }
-        : r
+      r.id === recordId ? { ...r, approved_by: 'ops_manager', approved_at: new Date().toISOString() } : r
     ));
     const { error } = await supabase
       .from('etl_records')
@@ -561,29 +876,44 @@ export default function ETLNormalization() {
     }
   };
 
-  // RDO approve: saves dates + note to pattern library
+  // RDO approve: saves parsed dates into ai_extracted_data on etl_records
+  // (rdo_requests requires employee_id FK — will be populated in AI Extraction
+  //  once employee roster is imported and payroll# → employee_id mapping exists)
   const handleApproveRDO = async (
     recordId: string,
     dates: string[],
     note: string,
     confidence: 'high' | 'medium' | 'low',
+    payrollNum: string,
   ) => {
     // Optimistic update
     cacheApproveRecord(recordId, 'ops_manager');
     setRecords(prev => prev.map(r =>
-      r.id === recordId
-        ? { ...r, approved_by: 'ops_manager', approved_at: new Date().toISOString() }
-        : r
+      r.id === recordId ? { ...r, approved_by: 'ops_manager', approved_at: new Date().toISOString() } : r
     ));
 
     // Save to pattern library
     await savePattern(note, dates, confidence, 'ops_manager');
     refreshPatterns();
 
-    // Persist approval to DB
+    // Persist approval + extracted RDO dates to etl_records.ai_extracted_data
+    const aiExtracted = {
+      type: 'rdo_request',
+      payroll_number: payrollNum || null,
+      rdo_dates: dates,
+      source_note: note,
+      confidence,
+      extracted_at: new Date().toISOString(),
+      // Will be linked to employee_id in AI Extraction step once employee roster is imported
+    };
+
     const { error } = await supabase
       .from('etl_records')
-      .update({ approved_by: 'ops_manager', approved_at: new Date().toISOString() })
+      .update({
+        approved_by: 'ops_manager',
+        approved_at: new Date().toISOString(),
+        ai_extracted_data: aiExtracted,
+      })
       .eq('id', recordId);
 
     if (error) {
@@ -614,7 +944,6 @@ export default function ETLNormalization() {
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Main content */}
       <div className="flex flex-col flex-1 overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-3 border-b border-border flex-shrink-0">
@@ -629,20 +958,16 @@ export default function ETLNormalization() {
           </div>
           <div className="flex items-center gap-2">
             <Button
-              variant="outline"
-              size="sm"
+              variant="outline" size="sm"
               className={`h-7 text-xs gap-1.5 border-border ${sidePanel === 'learning' ? 'border-teal/40 text-teal bg-teal/5' : ''}`}
               onClick={() => setSidePanel(p => p === 'learning' ? null : 'learning')}
             >
               <BookOpen className="w-3 h-3" />
               Pattern Library
-              {patterns.length > 0 && (
-                <span className="ml-0.5 text-teal font-mono">{patterns.length}</span>
-              )}
+              {patterns.length > 0 && <span className="ml-0.5 text-teal font-mono">{patterns.length}</span>}
             </Button>
             <Button
-              variant="outline"
-              size="sm"
+              variant="outline" size="sm"
               className="h-7 text-xs gap-1.5 border-border"
               onClick={() => loadData(true)}
               disabled={loading}
@@ -758,7 +1083,7 @@ export default function ETLNormalization() {
         </div>
       </div>
 
-      {/* Side panel: Pattern Library */}
+      {/* Side panel */}
       {sidePanel === 'learning' && <LearningLogPanel patterns={patterns} />}
     </div>
   );
