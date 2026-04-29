@@ -495,18 +495,21 @@ async function _runExtraction(): Promise<ExtractionResult> {
     const expired_raw = String(rd['__EMPTY_7'] || '').trim().toLowerCase();
     const req_type = String(rd['__EMPTY_8'] || '').trim();
 
-    // Only SUP or DLR
-    if (position !== 'SUP' && position !== 'DLR') continue;
+    // Skip header row
+    if (emp_no === 'Emp #' || position === 'Name') continue;
 
-    // Only shift/rdo restriction type or rows with shift/rdo content
-    const isShiftRdo = req_type.toLowerCase().includes('shift') || req_type.toLowerCase().includes('rdo');
-    const hasShiftContent = /\bRDO\b|\bSHIFT\b|\bONLY\b|\bFIX\b|\bAVOID\b|\bNO\b|\bNOT\b/i.test(assigned_to_raw) ||
-      Array.from(SHIFT_CODES).some(s => new RegExp(`\\b${s}\\b`).test(assigned_to_raw.toUpperCase()));
+    // Skip rows with no assigned_to content
+    if (!assigned_to_raw || assigned_to_raw === 'Assigned to') continue;
 
-    if (!isShiftRdo && !hasShiftContent) continue;
-
+    // Determine expiry: treat empty expired field as active
+    // Expired if field contains 'expired', 'exp', or a past date string
+    // Active if field is empty, 'until further notice', or contains a future date
     const is_expired = expired_raw === 'expired' || expired_raw === 'exp' ||
-      (expired_raw !== '' && expired_raw !== 'until further notice' && expired_raw !== '0' && expired_raw !== 'false');
+      (expired_raw !== '' &&
+       expired_raw !== 'until further notice' &&
+       expired_raw !== '0' &&
+       expired_raw !== 'false' &&
+       !/\d{4}/.test(expired_raw));  // if it has a year, treat as active (date-bound)
 
     const parsed = parseSpecialRequest(assigned_to_raw);
 

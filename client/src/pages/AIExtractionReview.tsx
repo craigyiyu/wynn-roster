@@ -299,61 +299,93 @@ function RDOResultsTab({ records }: { records: RDOExtraction[] }) {
 
 // ─── Tab 3: Special Request Results ──────────────────────────────────────────
 
+const SR_TYPE_PRIORITY = ['Shift & RDO restriction', 'Location', 'Skills', 'Seat game', 'NTD', 'ATD', 'Health', 'Others'];
+
+function positionColor(pos: string) {
+  if (pos === 'SUP' || pos === 'PM') return 'border-indigo/30 text-indigo';
+  if (pos === 'DLR') return 'border-amber/30 text-amber';
+  if (pos === 'SPC') return 'border-teal/30 text-teal';
+  return 'border-border text-muted-foreground';
+}
+
 function SRResultsTab({ records }: { records: SRExtraction[] }) {
   const [search, setSearch] = useState('');
-  const [filter, setFilter] = useState<'all' | 'active' | 'expired' | 'extracted' | 'unclassified'>('active');
+  const [filterType, setFilterType] = useState<string>('active');
   const [expanded, setExpanded] = useState<string | null>(null);
+
+  // Group types for filter tabs
+  const typeCounts = useMemo(() => {
+    const active = records.filter(r => !r.is_expired);
+    const counts: Record<string, number> = { active: active.length, all: records.length };
+    for (const r of active) {
+      const t = r.req_type || 'Other';
+      counts[t] = (counts[t] || 0) + 1;
+    }
+    return counts;
+  }, [records]);
 
   const filtered = useMemo(() => {
     return records.filter(r => {
-      if (filter === 'active' && r.is_expired) return false;
-      if (filter === 'expired' && !r.is_expired) return false;
-      if (filter === 'extracted' && r.extraction_status !== 'extracted') return false;
-      if (filter === 'unclassified' && r.extraction_status !== 'unclassified') return false;
+      if (filterType === 'active' && r.is_expired) return false;
+      if (filterType !== 'active' && filterType !== 'all' && r.req_type !== filterType) return false;
+      if (filterType !== 'all' && filterType !== 'active' && r.is_expired) return false;
       if (search) {
         const s = search.toLowerCase();
-        return r.emp_no.includes(s) || r.assigned_to_raw.toLowerCase().includes(s) || r.position.toLowerCase().includes(s);
+        return r.emp_no.includes(s) ||
+          r.assigned_to_raw.toLowerCase().includes(s) ||
+          r.position.toLowerCase().includes(s) ||
+          r.req_type.toLowerCase().includes(s);
       }
       return true;
     });
-  }, [records, filter, search]);
+  }, [records, filterType, search]);
 
-  const counts = useMemo(() => ({
-    all: records.length,
-    active: records.filter(r => !r.is_expired).length,
-    expired: records.filter(r => r.is_expired).length,
-    extracted: records.filter(r => r.extraction_status === 'extracted').length,
-    unclassified: records.filter(r => r.extraction_status === 'unclassified').length,
-  }), [records]);
+  // Sort: Shift & RDO restriction first, then by type priority
+  const sorted = useMemo(() => {
+    return [...filtered].sort((a, b) => {
+      const ai = SR_TYPE_PRIORITY.indexOf(a.req_type);
+      const bi = SR_TYPE_PRIORITY.indexOf(b.req_type);
+      const aIdx = ai === -1 ? 99 : ai;
+      const bIdx = bi === -1 ? 99 : bi;
+      if (aIdx !== bIdx) return aIdx - bIdx;
+      return a.emp_no.localeCompare(b.emp_no);
+    });
+  }, [filtered]);
+
+  const filterTabs = [
+    { key: 'active', label: 'Active Only', count: typeCounts['active'] || 0 },
+    { key: 'all', label: 'All Records', count: typeCounts['all'] || 0 },
+    ...SR_TYPE_PRIORITY.filter(t => (typeCounts[t] || 0) > 0).map(t => ({
+      key: t,
+      label: t,
+      count: typeCounts[t] || 0,
+    })),
+  ];
 
   return (
     <div className="space-y-3">
-      {/* Filter chips */}
-      <div className="flex items-center gap-2 flex-wrap">
-        {([
-          ['all', 'All', counts.all],
-          ['active', 'Active', counts.active],
-          ['expired', 'Expired', counts.expired],
-          ['extracted', 'Extracted', counts.extracted],
-          ['unclassified', 'Unclassified', counts.unclassified],
-        ] as const).map(([key, label, count]) => (
+      {/* Filter chips - scrollable */}
+      <div className="flex items-center gap-2 overflow-x-auto pb-1">
+        {filterTabs.map(({ key, label, count }) => (
           <button
             key={key}
-            onClick={() => setFilter(key)}
-            className={`text-[10px] font-mono px-2.5 py-1 rounded-full border transition-colors ${
-              filter === key
-                ? 'bg-teal/10 border-teal/30 text-teal'
+            onClick={() => setFilterType(key)}
+            className={`text-[10px] font-mono px-2.5 py-1 rounded-full border whitespace-nowrap transition-colors flex-shrink-0 ${
+              filterType === key
+                ? key === 'Shift & RDO restriction'
+                  ? 'bg-coral/10 border-coral/30 text-coral'
+                  : 'bg-teal/10 border-teal/30 text-teal'
                 : 'border-border text-muted-foreground hover:border-border/80'
             }`}
           >
             {label} <span className="ml-1 opacity-60">{count}</span>
           </button>
         ))}
-        <div className="flex-1 max-w-xs ml-auto">
+        <div className="flex-shrink-0 w-48 ml-auto">
           <div className="relative">
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-muted-foreground" />
             <Input
-              placeholder="Search emp#, assigned to..."
+              placeholder="Search emp#, content..."
               value={search}
               onChange={e => setSearch(e.target.value)}
               className="h-7 pl-7 text-xs bg-secondary/30 border-border/50"
@@ -363,104 +395,138 @@ function SRResultsTab({ records }: { records: SRExtraction[] }) {
       </div>
 
       {/* Records */}
-      <div className="space-y-1">
-        {filtered.slice(0, 200).map(r => (
-          <div key={r.source_etl_record_id} className={`border rounded-lg overflow-hidden ${r.is_expired ? 'border-border/30 opacity-60' : 'border-border/50'}`}>
+      <div className="space-y-1.5">
+        {sorted.slice(0, 300).map(r => {
+          const isShiftRdo = r.req_type === 'Shift & RDO restriction';
+          return (
             <div
-              className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-secondary/20 transition-colors"
-              onClick={() => setExpanded(expanded === r.source_etl_record_id ? null : r.source_etl_record_id)}
+              key={r.source_etl_record_id}
+              className={`border rounded-lg overflow-hidden ${
+                r.is_expired
+                  ? 'border-border/20 opacity-50'
+                  : isShiftRdo
+                    ? 'border-coral/20 bg-coral/[0.02]'
+                    : 'border-border/50'
+              }`}
             >
-              {expanded === r.source_etl_record_id
-                ? <ChevronDown className="w-3 h-3 text-muted-foreground flex-shrink-0" />
-                : <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />
-              }
+              <div
+                className="flex items-start gap-2 px-3 py-2.5 cursor-pointer hover:bg-secondary/20 transition-colors"
+                onClick={() => setExpanded(expanded === r.source_etl_record_id ? null : r.source_etl_record_id)}
+              >
+                {expanded === r.source_etl_record_id
+                  ? <ChevronDown className="w-3 h-3 text-muted-foreground flex-shrink-0 mt-0.5" />
+                  : <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0 mt-0.5" />
+                }
 
-              {/* Emp no + position */}
-              <span className="text-[11px] font-mono font-semibold text-foreground w-16 flex-shrink-0">#{r.emp_no}</span>
-              <Badge variant="outline" className={`text-[9px] flex-shrink-0 ${r.position === 'SUP' ? 'border-indigo/30 text-indigo' : 'border-amber/30 text-amber'}`}>{r.position}</Badge>
-
-              {/* Assigned to */}
-              <span className="text-[10px] font-mono text-muted-foreground flex-1 truncate">{r.assigned_to_raw}</span>
-
-              {/* AI tags */}
-              <div className="flex items-center gap-1 flex-shrink-0">
-                {r.ai_type && (
-                  <Badge variant="outline" className={`text-[9px] px-1.5 ${r.ai_type === 'allow' ? 'border-teal/30 text-teal' : 'border-coral/30 text-coral'}`}>
-                    {r.ai_type}
-                  </Badge>
-                )}
-                {r.ai_value.map(v => (
-                  <Badge key={v} variant="outline" className="text-[9px] border-indigo/30 text-indigo px-1 font-mono">{v}</Badge>
-                ))}
-                {r.ai_rdo.map(v => (
-                  <Badge key={v} variant="outline" className="text-[9px] border-teal/30 text-teal px-1 font-mono">RDO:{v}</Badge>
-                ))}
-              </div>
-
-              {/* Status */}
-              <div className="flex-shrink-0">{statusBadge(r.extraction_status)}</div>
-              {r.is_expired && <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5 flex-shrink-0">Expired</Badge>}
-            </div>
-
-            {/* Expanded detail */}
-            {expanded === r.source_etl_record_id && (
-              <div className="px-4 pb-3 pt-1 bg-secondary/10 border-t border-border/30">
-                <div className="grid grid-cols-2 gap-4 text-[11px]">
-                  <div className="space-y-1">
-                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">Source Record</p>
-                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Emp No</span><span className="font-mono text-foreground">#{r.emp_no}</span></div>
-                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Dept</span><span className="font-mono text-foreground">{r.dept}</span></div>
-                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Position</span><span className="font-mono text-foreground">{r.position}</span></div>
-                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Type</span><span className="font-mono text-foreground">{r.req_type}</span></div>
-                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Expired</span><span className={`font-mono ${r.is_expired ? 'text-coral' : 'text-teal'}`}>{r.is_expired ? 'Yes' : 'No'}</span></div>
-                  </div>
-                  <div className="space-y-1">
-                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">AI Extraction</p>
-                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Assigned To</span><span className="font-mono text-amber">{r.assigned_to_raw || '—'}</span></div>
-                    <div className="flex gap-2 items-center"><span className="text-muted-foreground w-24">ai_type</span>
-                      {r.ai_type
-                        ? <Badge variant="outline" className={`text-[9px] px-1.5 ${r.ai_type === 'allow' ? 'border-teal/30 text-teal' : 'border-coral/30 text-coral'}`}>{r.ai_type}</Badge>
-                        : <span className="text-muted-foreground italic">—</span>
-                      }
-                    </div>
-                    <div className="flex gap-2 items-start">
-                      <span className="text-muted-foreground w-24 flex-shrink-0">ai_value</span>
-                      <div className="flex gap-1 flex-wrap">
-                        {r.ai_value.length > 0
-                          ? r.ai_value.map(v => <Badge key={v} variant="outline" className="text-[9px] border-indigo/30 text-indigo px-1.5 font-mono">{v}</Badge>)
-                          : <span className="text-muted-foreground italic">[]</span>
-                        }
-                      </div>
-                    </div>
-                    <div className="flex gap-2 items-start">
-                      <span className="text-muted-foreground w-24 flex-shrink-0">ai_rdo</span>
-                      <div className="flex gap-1 flex-wrap">
-                        {r.ai_rdo.length > 0
-                          ? r.ai_rdo.map(v => <Badge key={v} variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5 font-mono">{v}</Badge>)
-                          : <span className="text-muted-foreground italic">[]</span>
-                        }
-                      </div>
-                    </div>
-                    {r.excluded_terms.length > 0 && (
-                      <div className="flex gap-2 items-start">
-                        <span className="text-muted-foreground w-24 flex-shrink-0">excluded</span>
-                        <div className="flex gap-1 flex-wrap">
-                          {r.excluded_terms.map(v => <Badge key={v} variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5 font-mono">{v}</Badge>)}
-                        </div>
-                      </div>
-                    )}
+                {/* Left: emp + position + type badge */}
+                <div className="flex flex-col gap-0.5 w-28 flex-shrink-0">
+                  <span className="text-[11px] font-mono font-semibold text-foreground">#{r.emp_no}</span>
+                  <div className="flex gap-1 flex-wrap">
+                    <Badge variant="outline" className={`text-[8px] px-1 ${positionColor(r.position)}`}>{r.position || '—'}</Badge>
+                    {isShiftRdo && <Badge variant="outline" className="text-[8px] px-1 border-coral/30 text-coral">Shift/RDO</Badge>}
                   </div>
                 </div>
+
+                {/* Center: full Assigned To text — NOT truncated */}
+                <div className="flex-1 min-w-0">
+                  <p className={`text-[11px] font-mono leading-snug break-words ${
+                    isShiftRdo ? 'text-foreground font-medium' : 'text-muted-foreground'
+                  }`}>
+                    {r.assigned_to_raw}
+                  </p>
+                  {!isShiftRdo && (
+                    <p className="text-[9px] text-muted-foreground/60 mt-0.5">{r.req_type}</p>
+                  )}
+                </div>
+
+                {/* Right: AI interpretation */}
+                <div className="flex flex-col items-end gap-1 flex-shrink-0 ml-2">
+                  <div className="flex items-center gap-1 flex-wrap justify-end">
+                    {r.ai_type && (
+                      <Badge variant="outline" className={`text-[9px] px-1.5 ${
+                        r.ai_type === 'allow' ? 'border-teal/30 text-teal' : 'border-coral/30 text-coral'
+                      }`}>
+                        {r.ai_type}
+                      </Badge>
+                    )}
+                    {r.ai_value.map(v => (
+                      <Badge key={v} variant="outline" className="text-[9px] border-indigo/30 text-indigo px-1 font-mono">{v}</Badge>
+                    ))}
+                    {r.ai_rdo.map(v => (
+                      <Badge key={v} variant="outline" className="text-[9px] border-teal/30 text-teal px-1 font-mono">RDO:{v}</Badge>
+                    ))}
+                  </div>
+                  {r.is_expired && (
+                    <Badge variant="outline" className="text-[8px] border-border text-muted-foreground px-1.5">Expired</Badge>
+                  )}
+                </div>
               </div>
-            )}
-          </div>
-        ))}
-        {filtered.length > 200 && (
+
+              {/* Expanded detail */}
+              {expanded === r.source_etl_record_id && (
+                <div className="px-4 pb-3 pt-2 bg-secondary/10 border-t border-border/30">
+                  <div className="grid grid-cols-2 gap-4 text-[11px]">
+                    <div className="space-y-1.5">
+                      <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">Source Record</p>
+                      <div className="flex gap-2"><span className="text-muted-foreground w-24 flex-shrink-0">Emp No</span><span className="font-mono text-foreground">#{r.emp_no}</span></div>
+                      <div className="flex gap-2"><span className="text-muted-foreground w-24 flex-shrink-0">Dept</span><span className="font-mono text-foreground">{r.dept || '—'}</span></div>
+                      <div className="flex gap-2"><span className="text-muted-foreground w-24 flex-shrink-0">Position</span><span className="font-mono text-foreground">{r.position || '—'}</span></div>
+                      <div className="flex gap-2"><span className="text-muted-foreground w-24 flex-shrink-0">Request Type</span><span className="font-mono text-foreground">{r.req_type || '—'}</span></div>
+                      <div className="flex gap-2"><span className="text-muted-foreground w-24 flex-shrink-0">Status</span>
+                        <span className={`font-mono ${r.is_expired ? 'text-coral' : 'text-teal'}`}>{r.is_expired ? 'Expired' : 'Active'}</span>
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">AI Interpretation</p>
+                      <div className="flex gap-2 items-start">
+                        <span className="text-muted-foreground w-24 flex-shrink-0">Assigned To</span>
+                        <span className="font-mono text-amber leading-snug break-words">{r.assigned_to_raw || '—'}</span>
+                      </div>
+                      <div className="flex gap-2 items-center"><span className="text-muted-foreground w-24 flex-shrink-0">ai_type</span>
+                        {r.ai_type
+                          ? <Badge variant="outline" className={`text-[9px] px-1.5 ${r.ai_type === 'allow' ? 'border-teal/30 text-teal' : 'border-coral/30 text-coral'}`}>{r.ai_type}</Badge>
+                          : <span className="text-muted-foreground italic text-[10px]">unclassified</span>
+                        }
+                      </div>
+                      <div className="flex gap-2 items-start">
+                        <span className="text-muted-foreground w-24 flex-shrink-0">Shifts</span>
+                        <div className="flex gap-1 flex-wrap">
+                          {r.ai_value.length > 0
+                            ? r.ai_value.map(v => <Badge key={v} variant="outline" className="text-[9px] border-indigo/30 text-indigo px-1.5 font-mono">{v}</Badge>)
+                            : <span className="text-muted-foreground italic text-[10px]">none parsed</span>
+                          }
+                        </div>
+                      </div>
+                      <div className="flex gap-2 items-start">
+                        <span className="text-muted-foreground w-24 flex-shrink-0">RDO Days</span>
+                        <div className="flex gap-1 flex-wrap">
+                          {r.ai_rdo.length > 0
+                            ? r.ai_rdo.map(v => <Badge key={v} variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5 font-mono">{v}</Badge>)
+                            : <span className="text-muted-foreground italic text-[10px]">none</span>
+                          }
+                        </div>
+                      </div>
+                      {r.excluded_terms.length > 0 && (
+                        <div className="flex gap-2 items-start">
+                          <span className="text-muted-foreground w-24 flex-shrink-0">Excluded</span>
+                          <div className="flex gap-1 flex-wrap">
+                            {r.excluded_terms.map(v => <Badge key={v} variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5 font-mono">{v}</Badge>)}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {sorted.length > 300 && (
           <p className="text-[10px] text-muted-foreground text-center py-2">
-            Showing 200 of {filtered.length} records. Use search to narrow down.
+            Showing 300 of {sorted.length} records. Use search to narrow down.
           </p>
         )}
-        {filtered.length === 0 && (
+        {sorted.length === 0 && (
           <div className="text-center py-8 text-muted-foreground text-sm">No records match the current filter.</div>
         )}
       </div>
