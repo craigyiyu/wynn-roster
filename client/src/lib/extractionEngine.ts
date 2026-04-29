@@ -267,6 +267,12 @@ function parseRDODates(note: string): { dates: string[]; confidence: 'high' | 'm
 // ─── Special Request Parser ───────────────────────────────────────────────────
 
 function parseSpecialRequest(assignedTo: string): Pick<SRExtraction, 'ai_type' | 'ai_value' | 'ai_rdo' | 'excluded_terms' | 'extraction_status'> {
+  // Rules:
+  // 1. ai_type: "only"/"fix" -> allow; "avoid"/"no"/"not" -> refuse; RDO-only -> allow
+  // 2. ai_value: ONLY the 7 standard shift codes (M/LM/ED/D/EV/ES/S). Exclude RDO/LT/SUN/seat game etc.
+  // 3. Time range: 12:00-20:00 -> ED; Night Shift -> EV/ES/S
+  // 4. ai_rdo: weekday (SUN/MON/...) or specific date (DD Mon YYYY)
+
   if (!assignedTo || !assignedTo.trim()) {
     return { ai_type: null, ai_value: [], ai_rdo: [], excluded_terms: [], extraction_status: 'empty' };
   }
@@ -274,30 +280,32 @@ function parseSpecialRequest(assignedTo: string): Pick<SRExtraction, 'ai_type' |
   const text = assignedTo.trim();
   const textUpper = text.toUpperCase();
 
-  // Determine ai_type
+  // Step 1: Determine ai_type (allow keywords take priority over refuse)
   let ai_type: 'allow' | 'refuse' | null = null;
-  if (/\bONLY\b|\bFIX(ED)?\b/.test(textUpper)) {
+  const hasAllow = /\bONLY\b|\bFIX(ED)?\b/.test(textUpper);
+  const hasRefuse = /\bAVOID\b|\bNO\b|\bNOT\b/.test(textUpper);
+  if (hasAllow) {
     ai_type = 'allow';
-  } else if (/\bAVOID\b|\bNO\b|\bNOT\b|\bEXCEPT\b/.test(textUpper)) {
+  } else if (hasRefuse) {
     ai_type = 'refuse';
   } else if (textUpper.includes('RDO')) {
     ai_type = 'allow';
   }
 
-  // Extract shift codes
+  // Step 2: Extract shift codes using word-boundary matching
+  // Order: longer codes first to avoid partial matches
+  const ORDERED_CODES = ['LM', 'ED', 'EV', 'ES', 'M', 'D', 'S'];
   const ai_value: string[] = [];
-  const excluded_terms: string[] = [];
-  const tokens = text.toUpperCase().split(/[\s,;/&+]+/);
-
-  for (const token of tokens) {
-    const t = token.replace(/\.$/, '').trim();
-    if (SHIFT_CODES.has(t)) {
-      ai_value.push(t);
+  for (const code of ORDERED_CODES) {
+    // Strict: code must be surrounded by non-alpha chars (not part of a longer word)
+    const re = new RegExp(`(?<![A-Z])${code}(?![A-Z])`);
+    if (re.test(textUpper)) {
+      ai_value.push(code);
     }
   }
 
   // Time range mapping
-  if (text.includes('12:00-20:00') || text.includes('1200-2000')) {
+  if (/12:?00\s*[-]\s*20:?00/.test(text)) {
     if (!ai_value.includes('ED')) ai_value.push('ED');
   }
   if (/NIGHT\s*SHIFT/i.test(text)) {
@@ -306,44 +314,58 @@ function parseSpecialRequest(assignedTo: string): Pick<SRExtraction, 'ai_type' |
     }
   }
 
-  // Collect excluded terms (non-shift words that look meaningful)
-  const SKIP_WORDS = new Set(['AND', 'OR', 'ON', 'AT', 'THE', 'TO', 'FROM', 'WITH', 'FOR', 'A', 'IN', 'OF', 'NO', 'NOT', 'ONLY', 'FIX', 'FIXED', 'AVOID', 'SHIFT', 'RDO']);
+  // Step 3: Extract RDO information
+  const ai_rdo: string[] = [];
+
+  // 3a. Weekday RDO: "Fix RDO SUN", "RDO on Sunday", "same RDO with WP..."
+  if (textUpper.includes('RDO')) {
+    for (const [full, abbr] of Object.entries(WEEKDAY_MAP)) {
+      const rdoWeekdayRe = new RegExp(
+        `RDO[^\\n]{0,30}\\b${full}\\b|\\b${full}\\b[^\\n]{0,30}RDO`,
+        'i'
+      );
+      if (rdoWeekdayRe.test(textUpper)) {
+        if (!ai_rdo.includes(abbr)) ai_rdo.push(abbr);
+      }
+    }
+  }
+
+  // 3b. Specific date RDO: "RDO on 29 Mar 2026", "REQ RDO on 18 & 25 Mar"
+  if (textUpper.includes('RDO')) {
+    const dateRdoRe = /(?:RDO|REQ\s+RDO)\s+(?:ON|AT|@)?\s*(\d{1,2})(?:\s*[&,]\s*(\d{1,2}))?\s*([A-Z]{3,})(?:\s*(\d{4}))?/gi;
+    let dm: RegExpExecArray | null;
+    while ((dm = dateRdoRe.exec(textUpper)) !== null) {
+      const day1 = dm[1];
+      const day2 = dm[2];
+      const monStr = dm[3].substring(0, 3);
+      const yrStr = dm[4];
+      const mon = MONTH_MAP[monStr];
+      if (!mon) continue;
+      const yr = yrStr ? parseInt(yrStr) : 2026;
+      if (day1) ai_rdo.push(`${yr}-${String(mon).padStart(2, '0')}-${String(parseInt(day1)).padStart(2, '0')}`);
+      if (day2) ai_rdo.push(`${yr}-${String(mon).padStart(2, '0')}-${String(parseInt(day2)).padStart(2, '0')}`);
+    }
+  }
+
+  // Step 4: Collect non-standard excluded terms for reference
+  const excluded_terms: string[] = [];
+  const SKIP_WORDS = new Set([
+    'AND', 'OR', 'ON', 'AT', 'THE', 'TO', 'FROM', 'WITH', 'FOR', 'A', 'IN', 'OF',
+    'NO', 'NOT', 'ONLY', 'FIX', 'FIXED', 'AVOID', 'SHIFT', 'RDO', 'SAME', 'AS',
+    'REQUEST', 'REQ', 'WORK', 'NIGHT', 'AFTERNOON', 'MORNING',
+  ]);
+  const tokens = textUpper.split(/[\s,;/&+\-()+]+/);
   for (const token of tokens) {
-    const t = token.replace(/\.$/, '').trim();
+    const t = token.replace(/[^A-Z0-9]/g, '').trim();
     if (t.length > 1 && !SHIFT_CODES.has(t) && !SKIP_WORDS.has(t) && !/^\d+$/.test(t)) {
-      if (/SEAT|PCMS|PIT|HL|VIP|NB|ENC|SUP|DLR|GAME|ONLY|NSR|NTD/.test(t)) {
+      if (/^(LT|SUN|MON|TUE|WED|THU|FRI|SAT|SEAT|GAME|PIT|VIP|NTD|ATD|SPORTS|TEAM|NSR|HEARING|IMPAIRED|DSEDJ|INITIATIVE|APPROPRIATE|ROSTER|WP|SWING)$/.test(t)) {
         excluded_terms.push(t);
       }
     }
   }
 
-  // Extract RDO weekdays
-  const ai_rdo: string[] = [];
-
-  // Check for weekday RDO: "RDO on Sunday", "RDO SUN", "Fix RDO at Saturday"
-  for (const [full, abbr] of Object.entries(WEEKDAY_MAP)) {
-    const rdoWeekdayRe = new RegExp(`RDO[\\s\\w]*\\b${full}\\b|\\b${full}\\b[\\s\\w]*RDO`, 'i');
-    if (rdoWeekdayRe.test(textUpper)) {
-      if (!ai_rdo.includes(abbr)) ai_rdo.push(abbr);
-    }
-  }
-
-  // Check for specific date RDO: "RDO on 29 Mar 2026" or "REQ RDO on 18 & 25 Mar"
-  const dateRdoRe = /(?:RDO|REQ\s+RDO)\s+(?:ON|AT)?\s*(\d{1,2})\s*(?:&\s*(\d{1,2}))?\s*([A-Z]{3})\s*(?:(\d{4}))?/gi;
-  let dm: RegExpExecArray | null;
-  while ((dm = dateRdoRe.exec(textUpper)) !== null) {
-    const day1 = dm[1];
-    const day2 = dm[2];
-    const monStr = dm[3];
-    const yrStr = dm[4];
-    const mon = MONTH_MAP[monStr] || 4;
-    const yr = yrStr ? parseInt(yrStr) : 2026;
-    if (day1) ai_rdo.push(`${yr}-${String(mon).padStart(2, '0')}-${String(parseInt(day1)).padStart(2, '0')}`);
-    if (day2) ai_rdo.push(`${yr}-${String(mon).padStart(2, '0')}-${String(parseInt(day2)).padStart(2, '0')}`);
-  }
-
-  // Deduplicate
-  const uniqueValue = Array.from(new Set(ai_value));
+  // Step 5: Deduplicate, preserve order LM/ED/EV/ES/M/D/S
+  const uniqueValue = ORDERED_CODES.filter(c => ai_value.includes(c));
   const uniqueRdo = Array.from(new Set(ai_rdo));
   const uniqueExcluded = Array.from(new Set(excluded_terms));
 
@@ -501,15 +523,21 @@ async function _runExtraction(): Promise<ExtractionResult> {
     // Skip rows with no assigned_to content
     if (!assigned_to_raw || assigned_to_raw === 'Assigned to') continue;
 
-    // Determine expiry: treat empty expired field as active
-    // Expired if field contains 'expired', 'exp', or a past date string
-    // Active if field is empty, 'until further notice', or contains a future date
-    const is_expired = expired_raw === 'expired' || expired_raw === 'exp' ||
-      (expired_raw !== '' &&
-       expired_raw !== 'until further notice' &&
-       expired_raw !== '0' &&
-       expired_raw !== 'false' &&
-       !/\d{4}/.test(expired_raw));  // if it has a year, treat as active (date-bound)
+    // ── Default filter per user spec ──────────────────────────────────────
+    // 1. Position must be SUP or DLR (case-insensitive)
+    const posUpper = position.toUpperCase();
+    if (posUpper !== 'SUP' && posUpper !== 'DLR') continue;
+
+    // 2. Expired must be blank (empty string = active)
+    if (expired_raw !== '') continue;
+
+    // 3. Type must be "Shift & RDO restriction" (case-insensitive, flexible match)
+    const reqTypeUpper = req_type.toUpperCase();
+    if (!reqTypeUpper.includes('SHIFT') || !reqTypeUpper.includes('RDO')) continue;
+    // ─────────────────────────────────────────────────────────────────────
+
+    // is_expired is always false here (we already filtered out non-empty expired)
+    const is_expired = false;
 
     const parsed = parseSpecialRequest(assigned_to_raw);
 

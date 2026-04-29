@@ -299,82 +299,101 @@ function RDOResultsTab({ records }: { records: RDOExtraction[] }) {
 
 // ─── Tab 3: Special Request Results ──────────────────────────────────────────
 
-const SR_TYPE_PRIORITY = ['Shift & RDO restriction', 'Location', 'Skills', 'Seat game', 'NTD', 'ATD', 'Health', 'Others'];
-
 function positionColor(pos: string) {
-  if (pos === 'SUP' || pos === 'PM') return 'border-indigo/30 text-indigo';
+  if (pos === 'SUP') return 'border-indigo/30 text-indigo';
   if (pos === 'DLR') return 'border-amber/30 text-amber';
-  if (pos === 'SPC') return 'border-teal/30 text-teal';
   return 'border-border text-muted-foreground';
 }
 
+// SR tab: records are pre-filtered to SUP/DLR + not expired + Shift & RDO restriction
 function SRResultsTab({ records }: { records: SRExtraction[] }) {
   const [search, setSearch] = useState('');
-  const [filterType, setFilterType] = useState<string>('active');
+  const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [filterPos, setFilterPos] = useState<string>('all');
   const [expanded, setExpanded] = useState<string | null>(null);
 
-  // Group types for filter tabs
-  const typeCounts = useMemo(() => {
-    const active = records.filter(r => !r.is_expired);
-    const counts: Record<string, number> = { active: active.length, all: records.length };
-    for (const r of active) {
-      const t = r.req_type || 'Other';
-      counts[t] = (counts[t] || 0) + 1;
+  const statusCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: records.length };
+    for (const r of records) {
+      counts[r.extraction_status] = (counts[r.extraction_status] || 0) + 1;
+    }
+    return counts;
+  }, [records]);
+
+  const posCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: records.length };
+    for (const r of records) {
+      counts[r.position] = (counts[r.position] || 0) + 1;
     }
     return counts;
   }, [records]);
 
   const filtered = useMemo(() => {
     return records.filter(r => {
-      if (filterType === 'active' && r.is_expired) return false;
-      if (filterType !== 'active' && filterType !== 'all' && r.req_type !== filterType) return false;
-      if (filterType !== 'all' && filterType !== 'active' && r.is_expired) return false;
+      if (filterStatus !== 'all' && r.extraction_status !== filterStatus) return false;
+      if (filterPos !== 'all' && r.position !== filterPos) return false;
       if (search) {
         const s = search.toLowerCase();
         return r.emp_no.includes(s) ||
           r.assigned_to_raw.toLowerCase().includes(s) ||
-          r.position.toLowerCase().includes(s) ||
-          r.req_type.toLowerCase().includes(s);
+          r.position.toLowerCase().includes(s);
       }
       return true;
     });
-  }, [records, filterType, search]);
+  }, [records, filterStatus, filterPos, search]);
 
-  // Sort: Shift & RDO restriction first, then by type priority
+  // Sort by emp_no
   const sorted = useMemo(() => {
-    return [...filtered].sort((a, b) => {
-      const ai = SR_TYPE_PRIORITY.indexOf(a.req_type);
-      const bi = SR_TYPE_PRIORITY.indexOf(b.req_type);
-      const aIdx = ai === -1 ? 99 : ai;
-      const bIdx = bi === -1 ? 99 : bi;
-      if (aIdx !== bIdx) return aIdx - bIdx;
-      return a.emp_no.localeCompare(b.emp_no);
-    });
+    return [...filtered].sort((a, b) => a.emp_no.localeCompare(b.emp_no));
   }, [filtered]);
 
-  const filterTabs = [
-    { key: 'active', label: 'Active Only', count: typeCounts['active'] || 0 },
-    { key: 'all', label: 'All Records', count: typeCounts['all'] || 0 },
-    ...SR_TYPE_PRIORITY.filter(t => (typeCounts[t] || 0) > 0).map(t => ({
-      key: t,
-      label: t,
-      count: typeCounts[t] || 0,
-    })),
-  ];
+  const statusTabs = [
+    { key: 'all', label: 'All', count: statusCounts['all'] || 0 },
+    { key: 'extracted', label: 'Extracted', count: statusCounts['extracted'] || 0 },
+    { key: 'partial', label: 'Partial', count: statusCounts['partial'] || 0 },
+    { key: 'unclassified', label: 'Unclassified', count: statusCounts['unclassified'] || 0 },
+  ].filter(t => t.count > 0 || t.key === 'all');
+
+  const posTabs = [
+    { key: 'all', label: 'All', count: posCounts['all'] || 0 },
+    { key: 'SUP', label: 'SUP', count: posCounts['SUP'] || 0 },
+    { key: 'DLR', label: 'DLR', count: posCounts['DLR'] || 0 },
+  ].filter(t => t.count > 0 || t.key === 'all');
 
   return (
     <div className="space-y-3">
-      {/* Filter chips - scrollable */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1">
-        {filterTabs.map(({ key, label, count }) => (
+      {/* Header info */}
+      <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground">
+        <Shield className="w-3 h-3 text-coral" />
+        <span>Showing <strong className="text-foreground">{records.length}</strong> active Shift &amp; RDO restrictions for SUP/DLR employees</span>
+      </div>
+
+      {/* Filter row 1: by extraction status */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[9px] font-mono text-muted-foreground uppercase">AI Status:</span>
+        {statusTabs.map(({ key, label, count }) => (
           <button
             key={key}
-            onClick={() => setFilterType(key)}
+            onClick={() => setFilterStatus(key)}
             className={`text-[10px] font-mono px-2.5 py-1 rounded-full border whitespace-nowrap transition-colors flex-shrink-0 ${
-              filterType === key
-                ? key === 'Shift & RDO restriction'
-                  ? 'bg-coral/10 border-coral/30 text-coral'
-                  : 'bg-teal/10 border-teal/30 text-teal'
+              filterStatus === key
+                ? 'bg-teal/10 border-teal/30 text-teal'
+                : 'border-border text-muted-foreground hover:border-border/80'
+            }`}
+          >
+            {label} <span className="ml-1 opacity-60">{count}</span>
+          </button>
+        ))}
+        <span className="text-[9px] font-mono text-muted-foreground uppercase ml-3">Position:</span>
+        {posTabs.map(({ key, label, count }) => (
+          <button
+            key={key}
+            onClick={() => setFilterPos(key)}
+            className={`text-[10px] font-mono px-2.5 py-1 rounded-full border whitespace-nowrap transition-colors flex-shrink-0 ${
+              filterPos === key
+                ? key === 'SUP' ? 'bg-indigo/10 border-indigo/30 text-indigo'
+                : key === 'DLR' ? 'bg-amber/10 border-amber/30 text-amber'
+                : 'bg-teal/10 border-teal/30 text-teal'
                 : 'border-border text-muted-foreground hover:border-border/80'
             }`}
           >
