@@ -1,365 +1,774 @@
 /**
- * AI Extraction Review — Reads low-confidence & needs_review records from Supabase
- * Groups by record_type, shows AI confidence score, source vs interpretation side-by-side
- * Design: Control Tower dark theme — slate/teal/amber/red
+ * AI Extraction Review
+ * =====================
+ * Shows the results of the RDO + Special Request extraction pipeline.
+ * 5 tabs: Upload Summary | RDO Results | Special Request Results | Enriched Roster | Review Queue
+ *
+ * Data is loaded once and cached in memory (extractionEngine.ts).
+ * Design: Control Tower dark theme — slate/teal/amber/coral
  */
-import { useState, useEffect, useCallback } from 'react';
+
+import { useState, useEffect, useMemo } from 'react';
 import {
-  Sparkles, CheckCircle2, AlertTriangle, XCircle, Eye,
-  RefreshCw, ChevronDown, ChevronRight, FileSpreadsheet,
-  Filter, ArrowRight, Brain, ShieldCheck, Info,
+  FileSpreadsheet, CheckCircle2, AlertTriangle, Clock, RefreshCw,
+  Search, ChevronDown, ChevronRight, Sparkles, Database, User,
+  CalendarDays, Shield, XCircle, Info, ArrowRight,
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { supabase } from '@/lib/supabase';
-import { getOrCreateSession } from '@/lib/sessionManager';
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface ETLRecord {
-  id: string;
-  upload_batch_id: string;
-  source_file: string;
-  source_sheet: string;
-  row_number: number;
-  record_type: string;
-  raw_data: Record<string, unknown>;
-  normalized_data: Record<string, unknown> | null;
-  confidence_level: number;
-  warning_flags: string[];
-  needs_review: boolean;
-  approved_by: string | null;
-  approved_at: string | null;
-  status: string | null;
-}
-
-type ReviewFilter = 'all' | 'low_conf' | 'needs_review' | 'approved';
+import { Input } from '@/components/ui/input';
+import {
+  runExtraction, getExtractionCache, clearExtractionCache,
+  ALL_FILES, ExtractionResult, RDOExtraction, SRExtraction, EnrichedEmployee,
+} from '@/lib/extractionEngine';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function getConfidenceColor(conf: number): string {
-  if (conf >= 90) return 'text-teal';
-  if (conf >= 75) return 'text-amber';
-  return 'text-coral';
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-function getConfidenceBg(conf: number): string {
-  if (conf >= 90) return 'bg-teal/10 border-teal/20';
-  if (conf >= 75) return 'bg-amber/10 border-amber/20';
-  return 'bg-coral/10 border-coral/20';
+function confidenceBadge(conf: 'high' | 'medium' | 'low') {
+  if (conf === 'high') return <Badge variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5">High</Badge>;
+  if (conf === 'medium') return <Badge variant="outline" className="text-[9px] border-amber/30 text-amber px-1.5">Medium</Badge>;
+  return <Badge variant="outline" className="text-[9px] border-coral/30 text-coral px-1.5">Low</Badge>;
 }
 
-function getRecordTypeLabel(type: string): string {
-  const labels: Record<string, string> = {
-    shift: 'Shift Records',
-    rdo_request: 'RDO Requests',
-    couple_shift: 'Couple Shifts',
-    eves: 'EV/ES Employees',
-    floor_spread: 'Floor Spreads',
-    unknown: 'Unclassified',
-  };
-  return labels[type] || type;
+function statusBadge(status: string) {
+  if (status === 'extracted') return <Badge variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5">Extracted</Badge>;
+  if (status === 'needs_review') return <Badge variant="outline" className="text-[9px] border-amber/30 text-amber px-1.5">Needs Review</Badge>;
+  if (status === 'no_notes') return <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5">No Notes</Badge>;
+  if (status === 'no_rdo') return <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5">No RDO</Badge>;
+  if (status === 'partial') return <Badge variant="outline" className="text-[9px] border-amber/30 text-amber px-1.5">Partial</Badge>;
+  if (status === 'unclassified') return <Badge variant="outline" className="text-[9px] border-coral/30 text-coral px-1.5">Unclassified</Badge>;
+  return <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5">{status}</Badge>;
 }
 
-function getRecordTypeIcon(type: string) {
-  const icons: Record<string, string> = {
-    shift: '📅',
-    rdo_request: '🗓',
-    couple_shift: '👫',
-    eves: '👤',
-    floor_spread: '📊',
-    unknown: '❓',
-  };
-  return icons[type] || '📄';
-}
+// ─── Tab 1: Upload Summary ────────────────────────────────────────────────────
 
-/**
- * Build a human-readable AI interpretation from raw_data
- * This simulates what an AI would extract from the raw Excel fields
- */
-function buildAIInterpretation(record: ETLRecord): { field: string; aiValue: string; rawValue: string; confidence: number }[] {
-  const raw = record.raw_data;
-  const results: { field: string; aiValue: string; rawValue: string; confidence: number }[] = [];
-
-  if (record.record_type === 'shift') {
-    // Shift records: look for employee ID, position, shift times
-    const empId = raw['__EMPTY'] || raw['Payroll'] || raw['EMP_ID'];
-    const position = raw['__EMPTY_1'] || raw['Position'] || raw['POSITION'];
-    
-    if (empId) results.push({
-      field: 'Employee ID',
-      aiValue: typeof empId === 'number' && empId > 100000 ? `EMP-${empId}` : String(empId),
-      rawValue: String(empId),
-      confidence: typeof empId === 'number' ? 95 : 70,
-    });
-    if (position) results.push({
-      field: 'Position',
-      aiValue: String(position).replace('TGF-', '').trim(),
-      rawValue: String(position),
-      confidence: 90,
-    });
-
-    // Extract shift times from date columns
-    const shiftTimes = Object.entries(raw)
-      .filter(([k, v]) => k.startsWith('__EMPTY_') && typeof v === 'string' && /\d{4}-\d{4}/.test(String(v)))
-      .slice(0, 3);
-    
-    shiftTimes.forEach(([k, v]) => {
-      results.push({
-        field: `Shift (col ${k})`,
-        aiValue: String(v),
-        rawValue: String(v),
-        confidence: 88,
-      });
-    });
-
-    // Check for RDO
-    const rdoEntries = Object.entries(raw).filter(([, v]) => v === 'RDO');
-    if (rdoEntries.length > 0) {
-      results.push({
-        field: 'RDO Days',
-        aiValue: `${rdoEntries.length} RDO day(s) detected`,
-        rawValue: rdoEntries.map(([k]) => k).join(', '),
-        confidence: 95,
-      });
-    }
-  } else if (record.record_type === 'couple_shift') {
-    const emp1Id = raw['__EMPTY'];
-    const emp2Id = raw['__EMPTY_3'];
-    const emp2Name = raw['__EMPTY_4'];
-    const shiftType = raw['__EMPTY_7'];
-    const status = raw['__EMPTY_11'];
-
-    if (emp1Id) results.push({ field: 'Employee 1 ID', aiValue: String(emp1Id), rawValue: String(emp1Id), confidence: 85 });
-    if (emp2Id) results.push({ field: 'Employee 2 ID', aiValue: String(emp2Id), rawValue: String(emp2Id), confidence: 85 });
-    if (emp2Name) results.push({ field: 'Employee 2 Name', aiValue: String(emp2Name), rawValue: String(emp2Name), confidence: 90 });
-    if (shiftType) results.push({ field: 'Couple Type', aiValue: String(shiftType), rawValue: String(shiftType), confidence: 88 });
-    if (status) results.push({ field: 'Approval Status', aiValue: String(status), rawValue: String(status), confidence: 92 });
-  } else if (record.record_type === 'floor_spread') {
-    const shift = raw['SHIFT'] || raw['2026 Spares for SL'];
-    const mon = raw['Mon'];
-    const tue = raw['Tue'];
-    const wed = raw['Wed'];
-
-    if (shift) results.push({ field: 'Shift Time', aiValue: String(shift), rawValue: String(shift), confidence: 85 });
-    if (mon !== undefined) results.push({ field: 'Mon Headcount', aiValue: String(mon), rawValue: String(mon), confidence: 90 });
-    if (tue !== undefined) results.push({ field: 'Tue Headcount', aiValue: String(tue), rawValue: String(tue), confidence: 90 });
-    if (wed !== undefined) results.push({ field: 'Wed Headcount', aiValue: String(wed), rawValue: String(wed), confidence: 90 });
-  } else {
-    // Unknown: show first 4 non-empty fields
-    Object.entries(raw)
-      .filter(([, v]) => v !== null && v !== undefined && v !== '')
-      .slice(0, 4)
-      .forEach(([k, v]) => {
-        results.push({
-          field: k,
-          aiValue: String(v),
-          rawValue: String(v),
-          confidence: 60,
-        });
-      });
-  }
-
-  return results;
-}
-
-// ─── Record Card ──────────────────────────────────────────────────────────────
-
-function AIRecordCard({ record, onApprove, onReject }: {
-  record: ETLRecord;
-  onApprove: (id: string) => void;
-  onReject: (id: string) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const conf = record.confidence_level;
-  const interpretation = buildAIInterpretation(record);
-
+function UploadSummaryTab({ result }: { result: ExtractionResult }) {
   return (
-    <div className={`border border-border rounded-lg overflow-hidden mb-2 ${record.approved_by ? 'opacity-60' : ''}`}>
-      {/* Header row */}
-      <div
-        className={`flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-secondary/20 transition-colors ${getConfidenceBg(conf)}`}
-        onClick={() => setExpanded(!expanded)}
-      >
-        {expanded ? <ChevronDown className="w-3 h-3 text-muted-foreground flex-shrink-0" /> : <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />}
-
-        {/* File + row */}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] font-mono text-muted-foreground truncate max-w-[200px]">{record.source_file}</span>
-            <span className="text-[9px] text-muted-foreground/60">· {record.source_sheet} · row {record.row_number}</span>
-          </div>
-        </div>
-
-        {/* Confidence bar */}
-        <div className="flex items-center gap-2 flex-shrink-0">
-          <div className="w-16 h-1.5 bg-secondary rounded-full overflow-hidden">
-            <div
-              className={`h-full rounded-full ${conf >= 90 ? 'bg-teal' : conf >= 75 ? 'bg-amber' : 'bg-coral'}`}
-              style={{ width: `${conf}%` }}
-            />
-          </div>
-          <span className={`text-[10px] font-mono font-semibold w-10 ${getConfidenceColor(conf)}`}>{conf.toFixed(0)}%</span>
-        </div>
-
-        {/* Status */}
-        <div className="flex items-center gap-1.5 flex-shrink-0">
-          {!!record.approved_by && <Badge variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5">✓ Approved</Badge>}
-          {record.needs_review && !record.approved_by && <Badge variant="outline" className="text-[9px] border-amber/30 text-amber px-1.5">⚠ Review</Badge>}
-          {record.warning_flags.length > 0 && (
-            <Badge variant="outline" className="text-[9px] border-amber/30 text-amber px-1.5">{record.warning_flags.length}w</Badge>
-          )}
-        </div>
-
-        {/* Action buttons */}
-        {!record.approved_by && (
-          <div className="flex gap-1 flex-shrink-0" onClick={e => e.stopPropagation()}>
-            <Button size="sm" variant="outline" className="h-5 text-[9px] px-2 border-teal/30 text-teal hover:bg-teal/10"
-              onClick={() => onApprove(record.id)}>
-              Approve
-            </Button>
-            <Button size="sm" variant="outline" className="h-5 text-[9px] px-2 border-coral/30 text-coral hover:bg-coral/10"
-              onClick={() => onReject(record.id)}>
-              Reject
-            </Button>
-          </div>
-        )}
+    <div className="space-y-4">
+      {/* Stats row */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {[
+          { label: 'Roster Employees', value: result.stats.total_roster, color: 'teal' },
+          { label: 'Leave Records', value: result.stats.total_leave_records, color: 'indigo' },
+          { label: 'Special Requests', value: result.stats.total_sr_records, color: 'amber' },
+          { label: 'Needs Review', value: result.stats.rdo_needs_review + result.enriched_roster.filter(e => e.review_status === 'needs_review').length, color: 'coral' },
+        ].map(({ label, value, color }) => (
+          <Card key={label} className="bg-card/50 border-border/50">
+            <CardContent className="p-3">
+              <p className="text-[10px] font-mono text-muted-foreground uppercase">{label}</p>
+              <p className={`text-2xl font-mono font-bold text-${color}`}>{value.toLocaleString()}</p>
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
-      {/* Expanded: AI interpretation vs raw */}
-      {expanded && (
-        <div className="p-3 bg-secondary/10 space-y-3">
-          {/* Warning flags */}
-          {record.warning_flags.length > 0 && (
-            <div className="bg-amber/5 border border-amber/20 rounded p-2">
-              <p className="text-[9px] font-mono text-amber mb-1 flex items-center gap-1">
-                <AlertTriangle className="w-3 h-3" /> Warning Flags
-              </p>
-              {record.warning_flags.map((w, i) => (
-                <p key={i} className="text-[10px] text-amber/80">• {w}</p>
+      {/* File list */}
+      <Card className="bg-card/50 border-border/50">
+        <CardContent className="p-4">
+          <p className="text-[10px] font-mono text-muted-foreground uppercase mb-3 flex items-center gap-1">
+            <FileSpreadsheet className="w-3 h-3" /> Uploaded Files — This Extraction Step
+          </p>
+          <div className="space-y-2">
+            {ALL_FILES.map((f) => (
+              <div key={f.name} className={`flex items-start gap-3 p-2.5 rounded-lg border ${f.used ? 'bg-teal/5 border-teal/20' : 'bg-secondary/20 border-border/30'}`}>
+                <div className={`mt-0.5 flex-shrink-0 w-4 h-4 rounded-full flex items-center justify-center ${f.used ? 'bg-teal/20' : 'bg-secondary'}`}>
+                  {f.used
+                    ? <CheckCircle2 className="w-3 h-3 text-teal" />
+                    : <Clock className="w-3 h-3 text-muted-foreground" />
+                  }
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className={`text-xs font-mono truncate ${f.used ? 'text-foreground' : 'text-muted-foreground'}`}>{f.name}</p>
+                  {f.used
+                    ? <p className="text-[10px] text-teal/70 mt-0.5">{(f as { role: string }).role}</p>
+                    : <p className="text-[10px] text-muted-foreground/60 mt-0.5">{(f as { reason: string }).reason}</p>
+                  }
+                </div>
+                <Badge variant="outline" className={`text-[9px] flex-shrink-0 ${f.used ? 'border-teal/30 text-teal' : 'border-border text-muted-foreground'}`}>
+                  {f.used ? 'Used' : 'Reserved'}
+                </Badge>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Extraction summary */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <Card className="bg-card/50 border-border/50">
+          <CardContent className="p-4">
+            <p className="text-[10px] font-mono text-muted-foreground uppercase mb-3 flex items-center gap-1">
+              <CalendarDays className="w-3 h-3 text-teal" /> RDO Extraction Summary
+            </p>
+            <div className="space-y-1.5">
+              {[
+                { label: 'Total leave records (Approved)', value: result.stats.total_leave_records },
+                { label: 'With extracted RDO dates', value: result.stats.rdo_with_dates, highlight: true },
+                { label: 'Needs human review', value: result.stats.rdo_needs_review, warn: true },
+                { label: 'Matched to roster', value: result.stats.roster_with_rdo },
+                { label: 'Unmatched payrolls', value: result.stats.unmatched_rdo, warn: result.stats.unmatched_rdo > 0 },
+              ].map(({ label, value, highlight, warn }) => (
+                <div key={label} className="flex items-center justify-between">
+                  <span className="text-[11px] text-muted-foreground">{label}</span>
+                  <span className={`text-[11px] font-mono font-semibold ${highlight ? 'text-teal' : warn ? 'text-amber' : 'text-foreground'}`}>{value}</span>
+                </div>
               ))}
             </div>
-          )}
+          </CardContent>
+        </Card>
 
-          {/* Side-by-side comparison */}
-          <div className="grid grid-cols-2 gap-3">
-            {/* Raw source */}
-            <div className="bg-secondary/30 rounded p-2.5">
-              <p className="text-[9px] font-mono text-muted-foreground mb-2 flex items-center gap-1">
-                <FileSpreadsheet className="w-3 h-3" /> SOURCE (Excel Raw)
-              </p>
-              <div className="space-y-1">
-                {Object.entries(record.raw_data)
-                  .filter(([, v]) => v !== null && v !== undefined && v !== '')
-                  .slice(0, 10)
-                  .map(([k, v]) => (
-                    <div key={k} className="flex gap-2 text-[9px]">
-                      <span className="font-mono text-muted-foreground w-28 flex-shrink-0 truncate">{k}:</span>
-                      <span className="text-foreground/70 truncate">
-                        {typeof v === 'number' && v > 40000 && v < 50000
-                          ? <span className="text-amber/70">[Excel date #{v}]</span>
-                          : String(v)
-                        }
-                      </span>
-                    </div>
-                  ))}
-                {Object.keys(record.raw_data).length > 10 && (
-                  <p className="text-[9px] text-muted-foreground">+{Object.keys(record.raw_data).length - 10} more fields</p>
-                )}
-              </div>
-            </div>
-
-            {/* AI interpretation */}
-            <div className="bg-teal/5 border border-teal/10 rounded p-2.5">
-              <p className="text-[9px] font-mono text-teal mb-2 flex items-center gap-1">
-                <Brain className="w-3 h-3" /> AI INTERPRETATION
-              </p>
-              {interpretation.length > 0 ? (
-                <div className="space-y-1.5">
-                  {interpretation.map((item, i) => (
-                    <div key={i} className="flex items-start gap-2">
-                      <div className="flex-1 min-w-0">
-                        <span className="text-[9px] font-mono text-muted-foreground">{item.field}: </span>
-                        <span className="text-[10px] text-foreground/90">{item.aiValue}</span>
-                      </div>
-                      <span className={`text-[9px] font-mono flex-shrink-0 ${getConfidenceColor(item.confidence)}`}>
-                        {item.confidence}%
-                      </span>
-                    </div>
-                  ))}
+        <Card className="bg-card/50 border-border/50">
+          <CardContent className="p-4">
+            <p className="text-[10px] font-mono text-muted-foreground uppercase mb-3 flex items-center gap-1">
+              <Shield className="w-3 h-3 text-indigo" /> Special Request Summary
+            </p>
+            <div className="space-y-1.5">
+              {[
+                { label: 'Total SR records (SUP/DLR)', value: result.stats.total_sr_records },
+                { label: 'Active (not expired)', value: result.stats.sr_active, highlight: true },
+                { label: 'Expired (historical)', value: result.stats.total_sr_records - result.stats.sr_active },
+                { label: 'Matched to roster', value: result.stats.roster_with_sr },
+                { label: 'Unmatched emp_nos', value: result.stats.unmatched_sr, warn: result.stats.unmatched_sr > 0 },
+              ].map(({ label, value, highlight, warn }) => (
+                <div key={label} className="flex items-center justify-between">
+                  <span className="text-[11px] text-muted-foreground">{label}</span>
+                  <span className={`text-[11px] font-mono font-semibold ${highlight ? 'text-teal' : warn ? 'text-amber' : 'text-foreground'}`}>{value}</span>
                 </div>
-              ) : (
-                <p className="text-[10px] text-muted-foreground italic">
-                  No structured fields extracted. Record classified as <span className="text-amber">unknown</span>.
-                </p>
-              )}
+              ))}
             </div>
-          </div>
-        </div>
-      )}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
 
-// ─── Type Group Panel ─────────────────────────────────────────────────────────
+// ─── Tab 2: RDO Results ───────────────────────────────────────────────────────
 
-function TypeGroupPanel({ type, records, filter, onApprove, onReject }: {
-  type: string;
-  records: ETLRecord[];
-  filter: ReviewFilter;
-  onApprove: (id: string) => void;
-  onReject: (id: string) => void;
-}) {
-  const filtered = records.filter(r => {
-    if (filter === 'all') return true;
-    if (filter === 'low_conf') return r.confidence_level < 80;
-    if (filter === 'needs_review') return r.needs_review && !r.approved_by;
-    if (filter === 'approved') return !!r.approved_by;
-    return true;
-  });
+function RDOResultsTab({ records }: { records: RDOExtraction[] }) {
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<'all' | 'extracted' | 'needs_review' | 'no_rdo'>('all');
+  const [expanded, setExpanded] = useState<string | null>(null);
 
-  const avgConf = records.length > 0
-    ? records.reduce((s, r) => s + r.confidence_level, 0) / records.length
-    : 0;
+  const filtered = useMemo(() => {
+    return records.filter(r => {
+      if (filter !== 'all' && r.extraction_status !== filter) return false;
+      if (search) {
+        const s = search.toLowerCase();
+        return r.payroll.includes(s) || r.raw_notes.toLowerCase().includes(s) || r.period.toLowerCase().includes(s);
+      }
+      return true;
+    });
+  }, [records, filter, search]);
 
-  if (filtered.length === 0) {
-    return (
-      <div className="p-4 text-center text-xs text-muted-foreground border border-border rounded-lg">
-        No {getRecordTypeLabel(type)} records match the current filter.
-      </div>
-    );
-  }
+  const counts = useMemo(() => ({
+    all: records.length,
+    extracted: records.filter(r => r.extraction_status === 'extracted').length,
+    needs_review: records.filter(r => r.extraction_status === 'needs_review').length,
+    no_rdo: records.filter(r => r.extraction_status === 'no_notes' || r.extraction_status === 'no_rdo').length,
+  }), [records]);
 
   return (
-    <div className="space-y-1">
-      {/* Group header */}
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-base">{getRecordTypeIcon(type)}</span>
-        <div>
-          <p className="text-xs font-mono font-semibold text-foreground">{getRecordTypeLabel(type)}</p>
-          <p className="text-[10px] text-muted-foreground">
-            {filtered.length.toLocaleString()} of {records.length.toLocaleString()} records shown
-            · avg confidence <span className={getConfidenceColor(avgConf)}>{avgConf.toFixed(0)}%</span>
-          </p>
+    <div className="space-y-3">
+      {/* Filter chips */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {([
+          ['all', 'All', counts.all],
+          ['extracted', 'Extracted', counts.extracted],
+          ['needs_review', 'Needs Review', counts.needs_review],
+          ['no_rdo', 'No RDO', counts.no_rdo],
+        ] as const).map(([key, label, count]) => (
+          <button
+            key={key}
+            onClick={() => setFilter(key)}
+            className={`text-[10px] font-mono px-2.5 py-1 rounded-full border transition-colors ${
+              filter === key
+                ? 'bg-teal/10 border-teal/30 text-teal'
+                : 'border-border text-muted-foreground hover:border-border/80'
+            }`}
+          >
+            {label} <span className="ml-1 opacity-60">{count}</span>
+          </button>
+        ))}
+        <div className="flex-1 max-w-xs ml-auto">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-muted-foreground" />
+            <Input
+              placeholder="Search payroll, notes..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              className="h-7 pl-7 text-xs bg-secondary/30 border-border/50"
+            />
+          </div>
         </div>
       </div>
 
       {/* Records */}
-      {filtered.slice(0, 100).map(record => (
-        <AIRecordCard
-          key={record.id}
-          record={record}
-          onApprove={onApprove}
-          onReject={onReject}
-        />
-      ))}
-      {filtered.length > 100 && (
-        <div className="p-3 text-center text-xs text-muted-foreground border border-border rounded">
-          Showing 100 of {filtered.length.toLocaleString()} records. Use filters to narrow down.
+      <div className="space-y-1">
+        {filtered.slice(0, 200).map(r => (
+          <div key={r.source_etl_record_id} className="border border-border/50 rounded-lg overflow-hidden">
+            <div
+              className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-secondary/20 transition-colors"
+              onClick={() => setExpanded(expanded === r.source_etl_record_id ? null : r.source_etl_record_id)}
+            >
+              {expanded === r.source_etl_record_id
+                ? <ChevronDown className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                : <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+              }
+
+              {/* Payroll */}
+              <span className="text-[11px] font-mono font-semibold text-foreground w-16 flex-shrink-0">#{r.payroll}</span>
+
+              {/* Period */}
+              <span className="text-[10px] font-mono text-muted-foreground w-32 flex-shrink-0">{r.period}</span>
+
+              {/* Notes */}
+              <span className="text-[10px] font-mono text-muted-foreground flex-1 truncate">
+                {r.raw_notes || <span className="italic opacity-50">no notes</span>}
+              </span>
+
+              {/* Extracted dates */}
+              <div className="flex items-center gap-1 flex-shrink-0">
+                {r.extracted_rdo_dates.map(d => (
+                  <Badge key={d} variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5 font-mono">
+                    {formatDate(d)}
+                  </Badge>
+                ))}
+              </div>
+
+              {/* Status */}
+              <div className="flex-shrink-0">{statusBadge(r.extraction_status)}</div>
+            </div>
+
+            {/* Expanded detail */}
+            {expanded === r.source_etl_record_id && (
+              <div className="px-4 pb-3 pt-1 bg-secondary/10 border-t border-border/30">
+                <div className="grid grid-cols-2 gap-4 text-[11px]">
+                  <div className="space-y-1">
+                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">Leave Record</p>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-20">Payroll</span><span className="font-mono text-foreground">#{r.payroll}</span></div>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-20">Period</span><span className="font-mono text-foreground">{r.period}</span></div>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-20">Days</span><span className="font-mono text-foreground">{r.days}</span></div>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-20">Leave Type</span><span className="font-mono text-foreground">{r.leave_type}</span></div>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">AI Extraction</p>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-20">Raw Notes</span><span className="font-mono text-amber">{r.raw_notes || '—'}</span></div>
+                    <div className="flex gap-2 items-start">
+                      <span className="text-muted-foreground w-20 flex-shrink-0">RDO Dates</span>
+                      <div className="flex gap-1 flex-wrap">
+                        {r.extracted_rdo_dates.length > 0
+                          ? r.extracted_rdo_dates.map(d => <Badge key={d} variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5 font-mono">{d}</Badge>)
+                          : <span className="text-muted-foreground italic">none extracted</span>
+                        }
+                      </div>
+                    </div>
+                    <div className="flex gap-2 items-center">
+                      <span className="text-muted-foreground w-20">Confidence</span>
+                      {confidenceBadge(r.confidence)}
+                    </div>
+                    <div className="flex gap-2 items-center">
+                      <span className="text-muted-foreground w-20">Status</span>
+                      {statusBadge(r.extraction_status)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+        {filtered.length > 200 && (
+          <p className="text-[10px] text-muted-foreground text-center py-2">
+            Showing 200 of {filtered.length} records. Use search to narrow down.
+          </p>
+        )}
+        {filtered.length === 0 && (
+          <div className="text-center py-8 text-muted-foreground text-sm">No records match the current filter.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab 3: Special Request Results ──────────────────────────────────────────
+
+function SRResultsTab({ records }: { records: SRExtraction[] }) {
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<'all' | 'active' | 'expired' | 'extracted' | 'unclassified'>('active');
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const filtered = useMemo(() => {
+    return records.filter(r => {
+      if (filter === 'active' && r.is_expired) return false;
+      if (filter === 'expired' && !r.is_expired) return false;
+      if (filter === 'extracted' && r.extraction_status !== 'extracted') return false;
+      if (filter === 'unclassified' && r.extraction_status !== 'unclassified') return false;
+      if (search) {
+        const s = search.toLowerCase();
+        return r.emp_no.includes(s) || r.assigned_to_raw.toLowerCase().includes(s) || r.position.toLowerCase().includes(s);
+      }
+      return true;
+    });
+  }, [records, filter, search]);
+
+  const counts = useMemo(() => ({
+    all: records.length,
+    active: records.filter(r => !r.is_expired).length,
+    expired: records.filter(r => r.is_expired).length,
+    extracted: records.filter(r => r.extraction_status === 'extracted').length,
+    unclassified: records.filter(r => r.extraction_status === 'unclassified').length,
+  }), [records]);
+
+  return (
+    <div className="space-y-3">
+      {/* Filter chips */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {([
+          ['all', 'All', counts.all],
+          ['active', 'Active', counts.active],
+          ['expired', 'Expired', counts.expired],
+          ['extracted', 'Extracted', counts.extracted],
+          ['unclassified', 'Unclassified', counts.unclassified],
+        ] as const).map(([key, label, count]) => (
+          <button
+            key={key}
+            onClick={() => setFilter(key)}
+            className={`text-[10px] font-mono px-2.5 py-1 rounded-full border transition-colors ${
+              filter === key
+                ? 'bg-teal/10 border-teal/30 text-teal'
+                : 'border-border text-muted-foreground hover:border-border/80'
+            }`}
+          >
+            {label} <span className="ml-1 opacity-60">{count}</span>
+          </button>
+        ))}
+        <div className="flex-1 max-w-xs ml-auto">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-muted-foreground" />
+            <Input
+              placeholder="Search emp#, assigned to..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              className="h-7 pl-7 text-xs bg-secondary/30 border-border/50"
+            />
+          </div>
         </div>
-      )}
+      </div>
+
+      {/* Records */}
+      <div className="space-y-1">
+        {filtered.slice(0, 200).map(r => (
+          <div key={r.source_etl_record_id} className={`border rounded-lg overflow-hidden ${r.is_expired ? 'border-border/30 opacity-60' : 'border-border/50'}`}>
+            <div
+              className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-secondary/20 transition-colors"
+              onClick={() => setExpanded(expanded === r.source_etl_record_id ? null : r.source_etl_record_id)}
+            >
+              {expanded === r.source_etl_record_id
+                ? <ChevronDown className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                : <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+              }
+
+              {/* Emp no + position */}
+              <span className="text-[11px] font-mono font-semibold text-foreground w-16 flex-shrink-0">#{r.emp_no}</span>
+              <Badge variant="outline" className={`text-[9px] flex-shrink-0 ${r.position === 'SUP' ? 'border-indigo/30 text-indigo' : 'border-amber/30 text-amber'}`}>{r.position}</Badge>
+
+              {/* Assigned to */}
+              <span className="text-[10px] font-mono text-muted-foreground flex-1 truncate">{r.assigned_to_raw}</span>
+
+              {/* AI tags */}
+              <div className="flex items-center gap-1 flex-shrink-0">
+                {r.ai_type && (
+                  <Badge variant="outline" className={`text-[9px] px-1.5 ${r.ai_type === 'allow' ? 'border-teal/30 text-teal' : 'border-coral/30 text-coral'}`}>
+                    {r.ai_type}
+                  </Badge>
+                )}
+                {r.ai_value.map(v => (
+                  <Badge key={v} variant="outline" className="text-[9px] border-indigo/30 text-indigo px-1 font-mono">{v}</Badge>
+                ))}
+                {r.ai_rdo.map(v => (
+                  <Badge key={v} variant="outline" className="text-[9px] border-teal/30 text-teal px-1 font-mono">RDO:{v}</Badge>
+                ))}
+              </div>
+
+              {/* Status */}
+              <div className="flex-shrink-0">{statusBadge(r.extraction_status)}</div>
+              {r.is_expired && <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5 flex-shrink-0">Expired</Badge>}
+            </div>
+
+            {/* Expanded detail */}
+            {expanded === r.source_etl_record_id && (
+              <div className="px-4 pb-3 pt-1 bg-secondary/10 border-t border-border/30">
+                <div className="grid grid-cols-2 gap-4 text-[11px]">
+                  <div className="space-y-1">
+                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">Source Record</p>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Emp No</span><span className="font-mono text-foreground">#{r.emp_no}</span></div>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Dept</span><span className="font-mono text-foreground">{r.dept}</span></div>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Position</span><span className="font-mono text-foreground">{r.position}</span></div>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Type</span><span className="font-mono text-foreground">{r.req_type}</span></div>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Expired</span><span className={`font-mono ${r.is_expired ? 'text-coral' : 'text-teal'}`}>{r.is_expired ? 'Yes' : 'No'}</span></div>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1">AI Extraction</p>
+                    <div className="flex gap-2"><span className="text-muted-foreground w-24">Assigned To</span><span className="font-mono text-amber">{r.assigned_to_raw || '—'}</span></div>
+                    <div className="flex gap-2 items-center"><span className="text-muted-foreground w-24">ai_type</span>
+                      {r.ai_type
+                        ? <Badge variant="outline" className={`text-[9px] px-1.5 ${r.ai_type === 'allow' ? 'border-teal/30 text-teal' : 'border-coral/30 text-coral'}`}>{r.ai_type}</Badge>
+                        : <span className="text-muted-foreground italic">—</span>
+                      }
+                    </div>
+                    <div className="flex gap-2 items-start">
+                      <span className="text-muted-foreground w-24 flex-shrink-0">ai_value</span>
+                      <div className="flex gap-1 flex-wrap">
+                        {r.ai_value.length > 0
+                          ? r.ai_value.map(v => <Badge key={v} variant="outline" className="text-[9px] border-indigo/30 text-indigo px-1.5 font-mono">{v}</Badge>)
+                          : <span className="text-muted-foreground italic">[]</span>
+                        }
+                      </div>
+                    </div>
+                    <div className="flex gap-2 items-start">
+                      <span className="text-muted-foreground w-24 flex-shrink-0">ai_rdo</span>
+                      <div className="flex gap-1 flex-wrap">
+                        {r.ai_rdo.length > 0
+                          ? r.ai_rdo.map(v => <Badge key={v} variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5 font-mono">{v}</Badge>)
+                          : <span className="text-muted-foreground italic">[]</span>
+                        }
+                      </div>
+                    </div>
+                    {r.excluded_terms.length > 0 && (
+                      <div className="flex gap-2 items-start">
+                        <span className="text-muted-foreground w-24 flex-shrink-0">excluded</span>
+                        <div className="flex gap-1 flex-wrap">
+                          {r.excluded_terms.map(v => <Badge key={v} variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5 font-mono">{v}</Badge>)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+        {filtered.length > 200 && (
+          <p className="text-[10px] text-muted-foreground text-center py-2">
+            Showing 200 of {filtered.length} records. Use search to narrow down.
+          </p>
+        )}
+        {filtered.length === 0 && (
+          <div className="text-center py-8 text-muted-foreground text-sm">No records match the current filter.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab 4: Enriched Roster ───────────────────────────────────────────────────
+
+function EnrichedRosterTab({ employees }: { employees: EnrichedEmployee[] }) {
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<'all' | 'with_rdo' | 'with_sr' | 'needs_review'>('all');
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const filtered = useMemo(() => {
+    return employees.filter(e => {
+      if (filter === 'with_rdo' && e.rdo_records.length === 0) return false;
+      if (filter === 'with_sr' && e.sr_records.length === 0) return false;
+      if (filter === 'needs_review' && e.review_status !== 'needs_review') return false;
+      if (search) {
+        const s = search.toLowerCase();
+        return e.employee_number.includes(s) || e.dept_position.toLowerCase().includes(s) || e.rotation.toLowerCase().includes(s);
+      }
+      return true;
+    });
+  }, [employees, filter, search]);
+
+  const counts = useMemo(() => ({
+    all: employees.length,
+    with_rdo: employees.filter(e => e.rdo_records.length > 0).length,
+    with_sr: employees.filter(e => e.sr_records.length > 0).length,
+    needs_review: employees.filter(e => e.review_status === 'needs_review').length,
+  }), [employees]);
+
+  const SHIFT_COLORS: Record<string, string> = {
+    '0700-1500': 'bg-sky-500/20 text-sky-400', '1000-1800': 'bg-sky-400/20 text-sky-300',
+    '1200-2000': 'bg-emerald-500/20 text-emerald-400', '1500-2300': 'bg-teal/20 text-teal',
+    '1800-0200': 'bg-amber/20 text-amber', '2000-0400': 'bg-orange-500/20 text-orange-400',
+    '2300-0700': 'bg-purple-500/20 text-purple-400',
+    'RDO': 'bg-coral/20 text-coral', 'UnifL': 'bg-pink-500/20 text-pink-400',
+  };
+
+  return (
+    <div className="space-y-3">
+      {/* Filter chips */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {([
+          ['all', 'All Employees', counts.all],
+          ['with_rdo', 'Has RDO Request', counts.with_rdo],
+          ['with_sr', 'Has Special Request', counts.with_sr],
+          ['needs_review', 'Needs Review', counts.needs_review],
+        ] as const).map(([key, label, count]) => (
+          <button
+            key={key}
+            onClick={() => setFilter(key)}
+            className={`text-[10px] font-mono px-2.5 py-1 rounded-full border transition-colors ${
+              filter === key
+                ? 'bg-teal/10 border-teal/30 text-teal'
+                : 'border-border text-muted-foreground hover:border-border/80'
+            }`}
+          >
+            {label} <span className="ml-1 opacity-60">{count}</span>
+          </button>
+        ))}
+        <div className="flex-1 max-w-xs ml-auto">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-muted-foreground" />
+            <Input
+              placeholder="Search emp#, dept, rotation..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              className="h-7 pl-7 text-xs bg-secondary/30 border-border/50"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Employees */}
+      <div className="space-y-1">
+        {filtered.slice(0, 150).map(e => (
+          <div key={e.employee_number} className="border border-border/50 rounded-lg overflow-hidden">
+            <div
+              className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-secondary/20 transition-colors"
+              onClick={() => setExpanded(expanded === e.employee_number ? null : e.employee_number)}
+            >
+              {expanded === e.employee_number
+                ? <ChevronDown className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                : <ChevronRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+              }
+
+              {/* Emp no */}
+              <span className="text-[11px] font-mono font-semibold text-foreground w-16 flex-shrink-0">{e.employee_number}</span>
+
+              {/* Dept/position */}
+              <span className="text-[10px] font-mono text-muted-foreground w-28 flex-shrink-0 truncate">{e.dept_position}</span>
+
+              {/* Rotation */}
+              <span className="text-[10px] font-mono text-muted-foreground w-24 flex-shrink-0 truncate">{e.rotation}</span>
+
+              {/* Tags */}
+              <div className="flex items-center gap-1 flex-1 flex-wrap">
+                {e.extracted_rdo_dates.map(d => (
+                  <Badge key={d} variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5 font-mono">RDO {formatDate(d)}</Badge>
+                ))}
+                {e.sr_records.filter(s => !s.is_expired).slice(0, 2).map((s, i) => (
+                  <Badge key={i} variant="outline" className={`text-[9px] px-1.5 font-mono ${s.ai_type === 'allow' ? 'border-indigo/30 text-indigo' : 'border-coral/30 text-coral'}`}>
+                    SR:{s.ai_type}{s.ai_value.length > 0 ? ` [${s.ai_value.join(',')}]` : ''}{s.ai_rdo.length > 0 ? ` RDO:${s.ai_rdo.join(',')}` : ''}
+                  </Badge>
+                ))}
+              </div>
+
+              {/* Review status */}
+              {e.review_status === 'needs_review' && (
+                <Badge variant="outline" className="text-[9px] border-amber/30 text-amber px-1.5 flex-shrink-0">⚠ Review</Badge>
+              )}
+            </div>
+
+            {/* Expanded detail */}
+            {expanded === e.employee_number && (
+              <div className="px-4 pb-3 pt-1 bg-secondary/10 border-t border-border/30 space-y-3">
+                {/* Shift schedule */}
+                <div>
+                  <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1.5">Shift Schedule (Apr 13–26)</p>
+                  <div className="flex gap-1 flex-wrap">
+                    {Object.entries(e.shifts).map(([date, shift]) => {
+                      const color = SHIFT_COLORS[shift] || 'bg-secondary text-muted-foreground';
+                      return (
+                        <div key={date} className="flex flex-col items-center gap-0.5">
+                          <span className="text-[8px] font-mono text-muted-foreground">{date.slice(5)}</span>
+                          <div className={`w-10 h-7 rounded flex items-center justify-center text-[9px] font-mono font-bold ${color}`}>
+                            {shift || '—'}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* RDO records */}
+                {e.rdo_records.length > 0 && (
+                  <div>
+                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1.5 flex items-center gap-1">
+                      <CalendarDays className="w-3 h-3 text-teal" /> RDO Requests ({e.rdo_records.length})
+                    </p>
+                    <div className="space-y-1">
+                      {e.rdo_records.map(r => (
+                        <div key={r.source_etl_record_id} className="flex items-center gap-2 text-[10px] font-mono bg-teal/5 border border-teal/10 rounded px-2 py-1">
+                          <span className="text-muted-foreground">{r.period}</span>
+                          <ArrowRight className="w-3 h-3 text-muted-foreground" />
+                          <span className="text-amber">{r.raw_notes || 'no notes'}</span>
+                          <ArrowRight className="w-3 h-3 text-muted-foreground" />
+                          <div className="flex gap-1">
+                            {r.extracted_rdo_dates.length > 0
+                              ? r.extracted_rdo_dates.map(d => <Badge key={d} variant="outline" className="text-[9px] border-teal/30 text-teal px-1 font-mono">{formatDate(d)}</Badge>)
+                              : <span className="text-muted-foreground italic">no dates</span>
+                            }
+                          </div>
+                          {statusBadge(r.extraction_status)}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* SR records */}
+                {e.sr_records.length > 0 && (
+                  <div>
+                    <p className="text-[9px] font-mono text-muted-foreground uppercase mb-1.5 flex items-center gap-1">
+                      <Shield className="w-3 h-3 text-indigo" /> Special Requests ({e.sr_records.length}, {e.active_sr_count} active)
+                    </p>
+                    <div className="space-y-1">
+                      {e.sr_records.map(s => (
+                        <div key={s.source_etl_record_id} className={`flex items-center gap-2 text-[10px] font-mono rounded px-2 py-1 border ${s.is_expired ? 'bg-secondary/20 border-border/20 opacity-50' : 'bg-indigo/5 border-indigo/10'}`}>
+                          <span className="text-muted-foreground">{s.position}</span>
+                          <span className="text-amber flex-1 truncate">{s.assigned_to_raw}</span>
+                          {s.ai_type && <Badge variant="outline" className={`text-[9px] px-1.5 ${s.ai_type === 'allow' ? 'border-teal/30 text-teal' : 'border-coral/30 text-coral'}`}>{s.ai_type}</Badge>}
+                          {s.ai_value.map(v => <Badge key={v} variant="outline" className="text-[9px] border-indigo/30 text-indigo px-1 font-mono">{v}</Badge>)}
+                          {s.ai_rdo.map(v => <Badge key={v} variant="outline" className="text-[9px] border-teal/30 text-teal px-1 font-mono">RDO:{v}</Badge>)}
+                          {s.is_expired && <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5">Expired</Badge>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+        {filtered.length > 150 && (
+          <p className="text-[10px] text-muted-foreground text-center py-2">
+            Showing 150 of {filtered.length} employees. Use search to narrow down.
+          </p>
+        )}
+        {filtered.length === 0 && (
+          <div className="text-center py-8 text-muted-foreground text-sm">No employees match the current filter.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab 5: Review Queue ──────────────────────────────────────────────────────
+
+function ReviewQueueTab({ result }: { result: ExtractionResult }) {
+  const rdoNeedsReview = result.rdo_extractions.filter(r => r.extraction_status === 'needs_review');
+  const srUnclassified = result.sr_extractions.filter(r => r.extraction_status === 'unclassified' && !r.is_expired);
+  const unmatched_rdo = result.unmatched_rdo;
+  const unmatched_sr = result.unmatched_sr;
+
+  return (
+    <div className="space-y-4">
+      {/* RDO needs review */}
+      <Card className="bg-card/50 border-amber/20">
+        <CardContent className="p-4">
+          <p className="text-[10px] font-mono text-amber uppercase mb-3 flex items-center gap-1">
+            <AlertTriangle className="w-3 h-3" /> RDO Notes — Cannot Parse ({rdoNeedsReview.length})
+          </p>
+          {rdoNeedsReview.length === 0
+            ? <p className="text-xs text-muted-foreground italic">None — all RDO notes were parsed successfully.</p>
+            : (
+              <div className="space-y-1.5">
+                {rdoNeedsReview.map(r => (
+                  <div key={r.source_etl_record_id} className="flex items-center gap-3 text-[11px] font-mono bg-amber/5 border border-amber/10 rounded px-2.5 py-1.5">
+                    <span className="text-muted-foreground w-16">#{r.payroll}</span>
+                    <span className="text-muted-foreground w-32">{r.period}</span>
+                    <span className="text-amber flex-1">"{r.raw_notes}"</span>
+                    <Badge variant="outline" className="text-[9px] border-amber/30 text-amber px-1.5">Needs Review</Badge>
+                  </div>
+                ))}
+              </div>
+            )
+          }
+        </CardContent>
+      </Card>
+
+      {/* SR unclassified */}
+      <Card className="bg-card/50 border-coral/20">
+        <CardContent className="p-4">
+          <p className="text-[10px] font-mono text-coral uppercase mb-3 flex items-center gap-1">
+            <XCircle className="w-3 h-3" /> Special Requests — Cannot Classify ({srUnclassified.length})
+          </p>
+          {srUnclassified.length === 0
+            ? <p className="text-xs text-muted-foreground italic">None — all active special requests were classified.</p>
+            : (
+              <div className="space-y-1.5">
+                {srUnclassified.map(r => (
+                  <div key={r.source_etl_record_id} className="flex items-center gap-3 text-[11px] font-mono bg-coral/5 border border-coral/10 rounded px-2.5 py-1.5">
+                    <span className="text-muted-foreground w-16">#{r.emp_no}</span>
+                    <Badge variant="outline" className={`text-[9px] flex-shrink-0 ${r.position === 'SUP' ? 'border-indigo/30 text-indigo' : 'border-amber/30 text-amber'}`}>{r.position}</Badge>
+                    <span className="text-coral flex-1">"{r.assigned_to_raw}"</span>
+                    <Badge variant="outline" className="text-[9px] border-coral/30 text-coral px-1.5">Unclassified</Badge>
+                  </div>
+                ))}
+              </div>
+            )
+          }
+        </CardContent>
+      </Card>
+
+      {/* Unmatched RDO */}
+      <Card className="bg-card/50 border-border/50">
+        <CardContent className="p-4">
+          <p className="text-[10px] font-mono text-muted-foreground uppercase mb-3 flex items-center gap-1">
+            <Info className="w-3 h-3" /> Unmatched RDO Payrolls ({unmatched_rdo.length})
+          </p>
+          {unmatched_rdo.length === 0
+            ? <p className="text-xs text-muted-foreground italic">All RDO payrolls matched to roster employees.</p>
+            : (
+              <div className="space-y-1.5">
+                {unmatched_rdo.map(r => (
+                  <div key={r.source_etl_record_id} className="flex items-center gap-3 text-[11px] font-mono bg-secondary/20 border border-border/30 rounded px-2.5 py-1.5">
+                    <span className="text-foreground w-16">#{r.payroll}</span>
+                    <span className="text-muted-foreground w-32">{r.period}</span>
+                    <div className="flex gap-1">
+                      {r.extracted_rdo_dates.map(d => <Badge key={d} variant="outline" className="text-[9px] border-teal/30 text-teal px-1.5 font-mono">{d}</Badge>)}
+                    </div>
+                    <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5">Not in 1.3</Badge>
+                  </div>
+                ))}
+              </div>
+            )
+          }
+        </CardContent>
+      </Card>
+
+      {/* Unmatched SR */}
+      <Card className="bg-card/50 border-border/50">
+        <CardContent className="p-4">
+          <p className="text-[10px] font-mono text-muted-foreground uppercase mb-3 flex items-center gap-1">
+            <Info className="w-3 h-3" /> Unmatched Special Requests ({unmatched_sr.length})
+          </p>
+          {unmatched_sr.length === 0
+            ? <p className="text-xs text-muted-foreground italic">All active special request employees matched to roster.</p>
+            : (
+              <div className="space-y-1.5">
+                {unmatched_sr.map(r => (
+                  <div key={r.source_etl_record_id} className="flex items-center gap-3 text-[11px] font-mono bg-secondary/20 border border-border/30 rounded px-2.5 py-1.5">
+                    <span className="text-foreground w-16">#{r.emp_no}</span>
+                    <Badge variant="outline" className={`text-[9px] flex-shrink-0 ${r.position === 'SUP' ? 'border-indigo/30 text-indigo' : 'border-amber/30 text-amber'}`}>{r.position}</Badge>
+                    <span className="text-muted-foreground flex-1 truncate">"{r.assigned_to_raw}"</span>
+                    <Badge variant="outline" className="text-[9px] border-border text-muted-foreground px-1.5">Not in 1.3</Badge>
+                  </div>
+                ))}
+              </div>
+            )
+          }
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -367,270 +776,131 @@ function TypeGroupPanel({ type, records, filter, onApprove, onReject }: {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function AIExtractionReview() {
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [records, setRecords] = useState<ETLRecord[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [result, setResult] = useState<ExtractionResult | null>(getExtractionCache());
+  const [loading, setLoading] = useState(!getExtractionCache());
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<ReviewFilter>('all');
-  const [activeTab, setActiveTab] = useState('all');
+  const [loadedAt, setLoadedAt] = useState<Date | null>(getExtractionCache() ? new Date() : null);
 
-  // Load session
   useEffect(() => {
-    getOrCreateSession()
-      .then(s => setSessionId(s.id))
-      .catch(() => { setError('Failed to load session'); setLoading(false); });
-  }, []);
-
-  // Load records when session changes
-  useEffect(() => {
-    if (!sessionId) return;
-    loadRecords(sessionId);
-  }, [sessionId]);
-
-  const loadRecords = useCallback(async (sid: string) => {
+    if (result) return;
     setLoading(true);
+    runExtraction()
+      .then(r => {
+        setResult(r);
+        setLoadedAt(new Date());
+        setError(null);
+      })
+      .catch(e => setError(String(e?.message || e)))
+      .finally(() => setLoading(false));
+  }, [result]);
+
+  const handleRefresh = () => {
+    clearExtractionCache();
+    setResult(null);
     setError(null);
-    try {
-      const allRecords: ETLRecord[] = [];
-      const PAGE = 1000;
-
-      for (let start = 0; ; start += PAGE) {
-        const end = start + PAGE - 1;
-        const { data, error: recErr } = await supabase
-          .from('etl_records')
-          .select('id,upload_batch_id,source_file,source_sheet,row_number,record_type,raw_data,normalized_data,confidence_level,warning_flags,needs_review,approved_by,approved_at,status')
-          .eq('session_id', sid)
-          .range(start, end);
-
-        if (recErr) throw recErr;
-        if (!data || data.length === 0) break;
-        allRecords.push(...(data as ETLRecord[]));
-        if (data.length < PAGE) break;
-      }
-
-      setRecords(allRecords);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Failed to load records');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const handleApprove = async (recordId: string) => {
-    await supabase
-      .from('etl_records')
-      .update({ approved_by: 'ops_manager', approved_at: new Date().toISOString() })
-      .eq('id', recordId);
-    if (sessionId) loadRecords(sessionId);
+    setLoading(true);
+    runExtraction()
+      .then(r => {
+        setResult(r);
+        setLoadedAt(new Date());
+        setError(null);
+      })
+      .catch(e => setError(String(e?.message || e)))
+      .finally(() => setLoading(false));
   };
-
-  const handleReject = async (recordId: string) => {
-    await supabase
-      .from('etl_records')
-      .update({ approved_by: null, approved_at: null })
-      .eq('id', recordId);
-    if (sessionId) loadRecords(sessionId);
-  };
-
-  // Group records by type
-  const recordsByType: Record<string, ETLRecord[]> = {};
-  for (const r of records) {
-    const t = r.record_type || 'unknown';
-    if (!recordsByType[t]) recordsByType[t] = [];
-    recordsByType[t].push(r);
-  }
-
-  const recordTypes = Object.keys(recordsByType).sort((a, b) => {
-    const order = ['shift', 'couple_shift', 'rdo_request', 'eves', 'floor_spread', 'unknown'];
-    return (order.indexOf(a) ?? 99) - (order.indexOf(b) ?? 99);
-  });
-
-  // Stats
-  const totalLowConf = records.filter(r => r.confidence_level < 80).length;
-  const totalNeedsReview = records.filter(r => r.needs_review && !r.approved_by).length;
-  const totalApproved = records.filter(r => !!r.approved_by).length;
-  const avgConf = records.length > 0
-    ? records.reduce((s, r) => s + r.confidence_level, 0) / records.length
-    : 0;
-
-  const filterButtons: { key: ReviewFilter; label: string; count: number }[] = [
-    { key: 'all', label: 'All', count: records.length },
-    { key: 'needs_review', label: 'Needs Review', count: totalNeedsReview },
-    { key: 'low_conf', label: 'Low Confidence', count: totalLowConf },
-    { key: 'approved', label: 'Approved', count: totalApproved },
-  ];
 
   return (
-    <div className="space-y-4 max-w-[1400px]">
+    <div className="p-4 space-y-4 max-w-7xl">
       {/* Header */}
-      <div className="flex items-start justify-between">
+      <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-sm font-mono font-semibold text-foreground flex items-center gap-2">
-            <Sparkles className="w-4 h-4 text-teal" />
-            AI EXTRACTION REVIEW
-          </h2>
+          <h1 className="text-lg font-mono font-bold text-foreground flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-teal" /> AI Extraction Review
+          </h1>
           <p className="text-xs text-muted-foreground mt-0.5">
-            AI-parsed fields from uploaded Excel files. Review low-confidence items and approve before roster generation.
+            RDO + Special Request extraction from leave request & couple shift files, matched to 1.3 roster
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="text-xs gap-1.5 border-border text-muted-foreground hover:text-foreground"
-          onClick={() => sessionId && loadRecords(sessionId)}
-          disabled={loading}
-        >
-          <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          {loadedAt && (
+            <span className="text-[10px] font-mono text-muted-foreground">
+              Loaded {loadedAt.toLocaleTimeString()} · cached
+            </span>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleRefresh}
+            disabled={loading}
+            className="h-7 text-xs border-border/50"
+          >
+            <RefreshCw className={`w-3 h-3 mr-1.5 ${loading ? 'animate-spin' : ''}`} />
+            Refresh
+          </Button>
+        </div>
       </div>
 
-      {/* AI pipeline explanation */}
-      <Card className="bg-teal/5 border-teal/20">
-        <CardContent className="p-3">
-          <div className="flex items-start gap-2">
-            <Brain className="w-4 h-4 text-teal flex-shrink-0 mt-0.5" />
-            <div className="text-xs text-muted-foreground space-y-1">
-              <p>
-                <span className="text-teal font-medium">AI Extraction Pipeline:</span> Each uploaded Excel row is parsed by the AI engine to extract structured fields (employee IDs, shift times, RDO dates, couple pairings). Records with <span className="text-amber">confidence &lt; 80%</span> or <span className="text-amber">missing required fields</span> are flagged for human review.
-              </p>
-              <div className="flex items-center gap-3 mt-2 flex-wrap">
-                {[
-                  { label: 'Excel Parse', done: true },
-                  { label: 'Field Extraction', done: true },
-                  { label: 'Confidence Score', done: true },
-                  { label: 'Human Review', done: totalApproved > 0 },
-                  { label: 'Roster Ready', done: false },
-                ].map((step, i, arr) => (
-                  <div key={step.label} className="flex items-center gap-1.5">
-                    <span className={`text-[10px] font-mono flex items-center gap-1 ${step.done ? 'text-teal' : 'text-muted-foreground'}`}>
-                      {step.done ? <CheckCircle2 className="w-3 h-3" /> : <Info className="w-3 h-3" />}
-                      {step.label}
-                    </span>
-                    {i < arr.length - 1 && <ArrowRight className="w-3 h-3 text-muted-foreground/30" />}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Stats row */}
-      <div className="grid grid-cols-4 gap-3">
-        {[
-          { label: 'Total Records', value: records.length.toLocaleString(), color: 'text-foreground', sub: `${recordTypes.length} types` },
-          { label: 'Avg Confidence', value: `${avgConf.toFixed(0)}%`, color: getConfidenceColor(avgConf), sub: 'across all records' },
-          { label: 'Needs Review', value: totalNeedsReview.toLocaleString(), color: 'text-amber', sub: 'flagged by AI' },
-          { label: 'Approved', value: totalApproved.toLocaleString(), color: 'text-teal', sub: 'ready for roster' },
-        ].map(stat => (
-          <Card key={stat.label} className="bg-card border-border">
-            <CardContent className="p-3">
-              <p className={`text-xl font-mono font-bold ${stat.color}`}>{loading ? '—' : stat.value}</p>
-              <p className="text-[10px] text-muted-foreground">{stat.label}</p>
-              <p className="text-[9px] text-muted-foreground/60 mt-0.5">{stat.sub}</p>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
+      {/* Loading state */}
+      {loading && (
+        <Card className="bg-card/50 border-border/50">
+          <CardContent className="p-8 text-center">
+            <RefreshCw className="w-6 h-6 text-teal animate-spin mx-auto mb-3" />
+            <p className="text-sm text-muted-foreground">Running extraction pipeline...</p>
+            <p className="text-[10px] text-muted-foreground mt-1">Loading 3 source files and matching to roster</p>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Error state */}
       {error && (
         <Card className="bg-coral/5 border-coral/20">
-          <CardContent className="p-3 flex items-center gap-2">
-            <XCircle className="w-4 h-4 text-coral" />
-            <p className="text-xs text-coral">{error}</p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Loading state */}
-      {loading && (
-        <Card className="bg-card border-border">
-          <CardContent className="p-8 text-center">
-            <Sparkles className="w-6 h-6 text-teal animate-pulse mx-auto mb-3" />
-            <p className="text-xs text-muted-foreground">Loading AI extraction results…</p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Empty state */}
-      {!loading && !error && records.length === 0 && (
-        <Card className="bg-card border-border">
-          <CardContent className="p-8 text-center">
-            <Brain className="w-8 h-8 text-muted-foreground mx-auto mb-3" />
-            <p className="text-sm text-muted-foreground">No records to review.</p>
-            <p className="text-xs text-muted-foreground mt-1">
-              Upload Excel files in <span className="text-teal font-mono">Data Intake</span> first.
-            </p>
+          <CardContent className="p-4 flex items-start gap-3">
+            <XCircle className="w-4 h-4 text-coral mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="text-sm font-medium text-coral">Extraction failed</p>
+              <p className="text-xs text-muted-foreground mt-1">{error}</p>
+            </div>
           </CardContent>
         </Card>
       )}
 
       {/* Main content */}
-      {!loading && !error && records.length > 0 && (
-        <div className="space-y-4">
-          {/* Filter bar */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <Filter className="w-3.5 h-3.5 text-muted-foreground" />
-            {filterButtons.map(btn => (
-              <button
-                key={btn.key}
-                onClick={() => setFilter(btn.key)}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded border text-[10px] font-mono transition-colors
-                  ${filter === btn.key
-                    ? 'text-teal border-teal/30 bg-teal/5'
-                    : 'text-muted-foreground border-border hover:border-foreground/20'
-                  }`}
-              >
-                {btn.label}
-                <span className="opacity-70">({btn.count.toLocaleString()})</span>
-              </button>
-            ))}
-          </div>
+      {result && !loading && (
+        <Tabs defaultValue="summary">
+          <TabsList className="bg-secondary/30 border border-border/50 h-8">
+            <TabsTrigger value="summary" className="text-[11px] h-6 data-[state=active]:bg-teal/10 data-[state=active]:text-teal">
+              Upload Summary
+            </TabsTrigger>
+            <TabsTrigger value="rdo" className="text-[11px] h-6 data-[state=active]:bg-teal/10 data-[state=active]:text-teal">
+              RDO Results <span className="ml-1 opacity-60">({result.stats.rdo_with_dates})</span>
+            </TabsTrigger>
+            <TabsTrigger value="sr" className="text-[11px] h-6 data-[state=active]:bg-teal/10 data-[state=active]:text-teal">
+              Special Requests <span className="ml-1 opacity-60">({result.stats.sr_active})</span>
+            </TabsTrigger>
+            <TabsTrigger value="roster" className="text-[11px] h-6 data-[state=active]:bg-teal/10 data-[state=active]:text-teal">
+              Enriched Roster <span className="ml-1 opacity-60">({result.stats.total_roster})</span>
+            </TabsTrigger>
+            <TabsTrigger value="review" className="text-[11px] h-6 data-[state=active]:bg-teal/10 data-[state=active]:text-teal">
+              Review Queue <span className="ml-1 opacity-60">({result.stats.rdo_needs_review + result.sr_extractions.filter(r => r.extraction_status === 'unclassified' && !r.is_expired).length})</span>
+            </TabsTrigger>
+          </TabsList>
 
-          {/* Tabs by record type */}
-          <Tabs value={activeTab} onValueChange={setActiveTab}>
-            <TabsList className="bg-secondary/30 flex-wrap h-auto gap-1 p-1">
-              <TabsTrigger value="all" className="text-[10px] font-mono gap-1">
-                All Types ({records.length.toLocaleString()})
-              </TabsTrigger>
-              {recordTypes.map(type => (
-                <TabsTrigger key={type} value={type} className="text-[10px] font-mono gap-1">
-                  {getRecordTypeIcon(type)} {getRecordTypeLabel(type)} ({recordsByType[type].length.toLocaleString()})
-                </TabsTrigger>
-              ))}
-            </TabsList>
-
-            {/* All types tab */}
-            <TabsContent value="all" className="mt-4 space-y-6">
-              {recordTypes.map(type => (
-                <div key={type}>
-                  <TypeGroupPanel
-                    type={type}
-                    records={recordsByType[type]}
-                    filter={filter}
-                    onApprove={handleApprove}
-                    onReject={handleReject}
-                  />
-                </div>
-              ))}
-            </TabsContent>
-
-            {/* Per-type tabs */}
-            {recordTypes.map(type => (
-              <TabsContent key={type} value={type} className="mt-4">
-                <TypeGroupPanel
-                  type={type}
-                  records={recordsByType[type]}
-                  filter={filter}
-                  onApprove={handleApprove}
-                  onReject={handleReject}
-                />
-              </TabsContent>
-            ))}
-          </Tabs>
-        </div>
+          <TabsContent value="summary" className="mt-4">
+            <UploadSummaryTab result={result} />
+          </TabsContent>
+          <TabsContent value="rdo" className="mt-4">
+            <RDOResultsTab records={result.rdo_extractions} />
+          </TabsContent>
+          <TabsContent value="sr" className="mt-4">
+            <SRResultsTab records={result.sr_extractions} />
+          </TabsContent>
+          <TabsContent value="roster" className="mt-4">
+            <EnrichedRosterTab employees={result.enriched_roster} />
+          </TabsContent>
+          <TabsContent value="review" className="mt-4">
+            <ReviewQueueTab result={result} />
+          </TabsContent>
+        </Tabs>
       )}
     </div>
   );
